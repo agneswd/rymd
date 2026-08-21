@@ -36,6 +36,9 @@ impl AppShell {
                 .gap_2()
                 .items_center()
                 .child(
+                    gpui::img("rymd.svg").size(px(16.)),
+                )
+                .child(
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::SEMIBOLD)

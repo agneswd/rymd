@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use gpui::{px, size, AppContext as _, Application, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use gpui_component::Root;
-use gpui_component_assets::Assets;
+use assets::Assets;
 
 mod actions;
+mod assets;
 mod duplicates;
 
 mod model;
