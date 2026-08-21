@@ -26,7 +26,7 @@ use super::layout::{squarify, FRect, TreemapItem, TreemapRect};
 const MIN_VISIBLE: f32 = 3.0;
 /// Padding between the container edge and the outermost rectangles, so
 /// selection outlines and labels never get clipped.
-const EDGE_PAD: f32 = 3.0;
+const EDGE_PAD: f32 = 4.0;
 /// Hard cap on rendered rectangles so huge folders stay cheap to draw.
 const MAX_RECTS: usize = 2000;
 
@@ -50,7 +50,11 @@ impl TreemapElement {
         shell: WeakEntity<AppShell>,
     ) -> Self {
         Self {
-            base: div().id("treemap").size_full().relative(),
+            base: div()
+                .id("treemap")
+                .size_full()
+                .relative()
+                .overflow_hidden(),
             items,
             model,
             dir_total,

@@ -22,7 +22,7 @@ use gpui_component::{
     button::ButtonVariant,
     dialog::DialogButtonProps,
     notification::NotificationType,
-    ActiveTheme as _, WindowExt as _,
+    ActiveTheme as _, Root, WindowExt as _,
 };
 use gpui_component::v_flex;
 use parking_lot::RwLock;
@@ -798,7 +798,7 @@ impl AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let theme = cx.theme();
 
         div()
@@ -838,5 +838,9 @@ impl Render for AppShell {
             .child(self.render_tab_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
+            // Modal, sheet and toast layers owned by gpui-component.
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
