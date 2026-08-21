@@ -1,20 +1,19 @@
 //! Render methods for [`AppShell`]. Split out of shell.rs so the event and
 //! state logic stays readable.
 
-use gpui::{div, px, Context, IntoElement,
-    ParentElement as _, SharedString, Styled as _};
 use gpui::prelude::FluentBuilder as _;
+use gpui::{div, px, Context, IntoElement, ParentElement as _, SharedString, Styled as _};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::resizable::{resizable_panel, v_resizable};
 use gpui_component::spinner::Spinner;
-use gpui_component::table::Table;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar};
+use gpui_component::table::Table;
+use gpui_component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
+};
 
-
-use std::path::PathBuf;
 use crate::model::NodeId;
 use crate::scan::options::SizeMetric;
 use crate::scan::scanner::ScanOutcome;
@@ -23,6 +22,7 @@ use crate::treemap::layout::TreemapItem;
 use crate::treemap::view::TreemapElement;
 use crate::util::format_size::{format_count, format_size};
 use crate::util::paths::shorten_home;
+use std::path::PathBuf;
 
 use super::shell::AppShell;
 
@@ -45,7 +45,7 @@ impl AppShell {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("disk usage"),
+                        .child("Disk usage"),
                 ),
         )
     }
@@ -90,14 +90,14 @@ impl AppShell {
                     })),
             );
 
-        // Open folder
+        // Open directory
         bar = bar.child(
             Button::new("open-folder")
                 .outline()
                 .small()
                 .icon(IconName::FolderOpen)
-                .label("Open folder")
-                .tooltip("Choose a folder to scan (Ctrl+O)")
+                .label("Open directory")
+                .tooltip("Choose a directory to scan (Ctrl+O)")
                 .on_click(cx.listener(|this, _ev: &gpui::ClickEvent, window, cx| {
                     this.choose_folder(window, cx);
                 })),
@@ -135,7 +135,7 @@ impl AppShell {
                 .ghost()
                 .small()
                 .icon(IconName::Redo2)
-                .tooltip("Rescan current folder (Ctrl+R)");
+                .tooltip("Rescan this directory (Ctrl+R)");
             if can_rescan {
                 rescan_btn =
                     rescan_btn.on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
@@ -276,7 +276,7 @@ impl AppShell {
                 theme.muted_foreground,
             ))
             .child(stat(
-                "Folders",
+                "Directories",
                 &dirs_val,
                 theme.foreground,
                 theme.muted_foreground,
@@ -374,7 +374,7 @@ impl AppShell {
                 div()
                     .text_lg()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .child("Choose a folder"),
+                    .child("Choose a directory"),
             )
             .child(
                 div()
@@ -385,13 +385,16 @@ impl AppShell {
             .child(
                 Button::new("empty-open")
                     .primary()
-                    .label("Open folder")
+                    .label("Open directory")
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
                         this.choose_folder(window, cx);
                     })),
             )
             .child(
-                h_flex().gap_2().mt_1().children(self.empty_state_presets(cx)),
+                h_flex()
+                    .gap_2()
+                    .mt_1()
+                    .children(self.empty_state_presets(cx)),
             )
     }
 
@@ -429,7 +432,7 @@ impl AppShell {
                 div()
                     .text_base()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .child("Could not scan this folder"),
+                    .child("Could not scan this directory"),
             )
             .child(div().text_sm().text_color(theme.danger).child(error))
             .child(
@@ -445,7 +448,7 @@ impl AppShell {
                     .child(
                         Button::new("err-choose")
                             .outline()
-                            .label("Choose another folder")
+                            .label("Choose another directory")
                             .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
                                 this.choose_folder(window, cx);
                             })),
@@ -552,7 +555,7 @@ impl AppShell {
 
         let left_text = if scanning {
             SharedString::from(format!(
-                "{} files · {} folders · {} errors · scanning",
+                "{} files · {} directories · {} errors · scanning",
                 format_count(self.progress.files_seen),
                 format_count(self.progress.dirs_seen),
                 format_count(self.progress.errors),
@@ -568,12 +571,12 @@ impl AppShell {
             let issues = m.issues().len();
             let cancelled_note = if m.was_cancelled { " · cancelled" } else { "" };
             SharedString::from(format!(
-                "{} files · {} folders · {issues} unreadable · scanned in {duration}{cancelled_note}",
+                "{} files · {} directories · {issues} unreadable · scanned in {duration}{cancelled_note}",
                 format_count(root.file_count),
                 format_count(root.dir_count),
             ))
         } else {
-            SharedString::from("No folder scanned")
+            SharedString::from("No directory scanned")
         };
 
         let metric_label = match self.state.metric {

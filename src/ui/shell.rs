@@ -58,7 +58,7 @@ pub struct ActiveScan {
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter this folder"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter this directory"));
         let delegate = FileTableDelegate::new();
         let table = cx.new(|cx| {
             TableState::new(delegate, window, cx)
@@ -328,6 +328,53 @@ impl AppShell {
     }
 
     // ---- deletion --------------------------------------------------------
+
+    /// Confirmation dialog before moving to Trash. Trash is recoverable,
+    /// but it is still a removal, so it always asks first.
+    pub fn confirm_trash(&mut self, node: NodeId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(model) = &self.model else { return };
+        if !crate::actions::fs_ops::verify_unchanged(&model.read(), node) {
+            self.warn_changed(cx);
+            return;
+        }
+        let (name, size, path, is_dir) = {
+            let m = model.read();
+            let n = m.node(node);
+            (
+                n.name.to_string_lossy().into_owned(),
+                n.agg_allocated,
+                m.path_of(node),
+                n.is_dir(),
+            )
+        };
+        let kind = if is_dir { "directory" } else { "file" };
+        let body = format!(
+            "Move this {kind} to Trash?\n\n{}\n{}\n{}\n\nSpace is reclaimed once the Trash is emptied.",
+            name,
+            path.to_string_lossy(),
+            format_size(size)
+        );
+        let weak = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Move to Trash?")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Move to Trash")
+                        .cancel_text("Cancel"),
+                )
+                .child(div().max_w(px(420.)).child(body.clone()))
+                .on_ok({
+                    let w = weak.clone();
+                    move |_, _, cx| {
+                        let _ = w.update(cx, |shell, cx| shell.trash_node(node, cx));
+                        false
+                    }
+                })
+        });
+    }
 
     pub fn trash_node(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let Some(model) = &self.model else { return };
@@ -641,7 +688,7 @@ impl AppShell {
     }
 
     fn on_rescan(&mut self, _: &Rescan, _: &mut Window, cx: &mut Context<Self>) {
-        // Rescan whichever folder is open right now, not the original root.
+        // Rescan whichever directory is open right now, not the original root.
         let target = match (&self.model, self.state.current_node) {
             (Some(m), Some(cur)) => m.read().path_of(cur),
             (Some(m), None) => m.read().root_path.clone(),
@@ -678,9 +725,9 @@ impl AppShell {
         }
     }
 
-    fn on_trash_selected(&mut self, _: &TrashSelected, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_trash_selected(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(n) = self.selected_node() {
-            self.trash_node(n, cx);
+            self.confirm_trash(n, window, cx);
         }
     }
 
@@ -720,8 +767,8 @@ impl AppShell {
         self.copy_node_path(a.0, cx);
     }
 
-    fn on_trash_node(&mut self, a: &TrashNode, _: &mut Window, cx: &mut Context<Self>) {
-        self.trash_node(a.0, cx);
+    fn on_trash_node(&mut self, a: &TrashNode, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_trash(a.0, window, cx);
     }
 
     fn on_delete_node(&mut self, a: &DeleteNode, window: &mut Window, cx: &mut Context<Self>) {
