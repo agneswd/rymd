@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libvulkan-dev libudev-dev \
+            cmake clang build-essential curl file
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage AppDir
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/512x512/apps \
+                   AppDir/usr/share/applications
+          cp target/release/rymd AppDir/usr/bin/
+          cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/rymd.png
+          cat > AppDir/rymd.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Rymd
+          Comment=Disk usage visualizer
+          Exec=rymd
+          Icon=rymd
+          Categories=System;Utility;
+          DESKTOP
+
+      - name: Build AppImage
+        run: |
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool AppDir rymd-${{ github.ref_name }}-x86_64.AppImage
+
+      - name: Tarball
+        run: |
+          mkdir -p pkg/rymd-${{ github.ref_name }}
+          cp target/release/rymd pkg/rymd-${{ github.ref_name }}/
+          cp README.md LICENSE pkg/rymd-${{ github.ref_name }}/ || true
+          tar -C pkg -czf rymd-${{ github.ref_name }}-x86_64.tar.gz .
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rymd-*-x86_64.AppImage
+            rymd-*-x86_64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Zip portable build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/rymd.exe dist/
+          Copy-Item README.md dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* `
+            -DestinationPath rymd-${{ github.ref_name }}-windows-x64.zip
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iss = @"
+          [Setup]
+          AppName=Rymd
+          AppVersion=${{ github.ref_name }}
+          DefaultDirName={autopf}\Rymd
+          OutputBaseFilename=rymd-${{ github.ref_name }}-setup-x64
+          OutputDir=.
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+
+          [Files]
+          Source: "target\release\rymd.exe"; DestDir: "{app}"
+
+          [Icons]
+          Name: "{autoprograms}\Rymd"; Filename: "{app}\rymd.exe"
+          Name: "{autodesktop}\Rymd"; Filename: "{app}\rymd.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
+            GroupDescription: "Additional icons:"
+          "@
+          Set-Content -Path rymd.iss -Value $iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rymd.iss
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rymd-*-windows-x64.zip
+            rymd-*-setup-x64.exe
