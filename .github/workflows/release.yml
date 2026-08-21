@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
 
+env:
+  RYMD_VERSION: ${{ github.ref_name }}
+
 jobs:
   linux:
     runs-on: ubuntu-24.04
@@ -50,19 +53,20 @@ jobs:
           curl -fsSL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
-          ./appimagetool AppDir rymd-${{ github.ref_name }}-x86_64.AppImage
+          ./appimagetool AppDir rymd-${{ env.RYMD_VERSION }}-x86_64.AppImage
 
       - name: Tarball
         run: |
-          mkdir -p pkg/rymd-${{ github.ref_name }}
-          cp target/release/rymd pkg/rymd-${{ github.ref_name }}/
-          cp README.md LICENSE pkg/rymd-${{ github.ref_name }}/ || true
-          tar -C pkg -czf rymd-${{ github.ref_name }}-x86_64.tar.gz .
+          mkdir -p pkg/rymd-${{ env.RYMD_VERSION }}
+          cp target/release/rymd pkg/rymd-${{ env.RYMD_VERSION }}/
+          cp README.md LICENSE pkg/rymd-${{ env.RYMD_VERSION }}/ || true
+          tar -C pkg -czf rymd-${{ env.RYMD_VERSION }}-x86_64.tar.gz .
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: linux-release
+          path: |
             rymd-*-x86_64.AppImage
             rymd-*-x86_64.tar.gz
 
@@ -84,7 +88,7 @@ jobs:
           Copy-Item target/release/rymd.exe dist/
           Copy-Item README.md dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist/* `
-            -DestinationPath rymd-${{ github.ref_name }}-windows-x64.zip
+            -DestinationPath rymd-${{ env.RYMD_VERSION }}-windows-x64.zip
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -92,9 +96,9 @@ jobs:
           $iss = @"
           [Setup]
           AppName=Rymd
-          AppVersion=${{ github.ref_name }}
+          AppVersion=${{ env.RYMD_VERSION }}
           DefaultDirName={autopf}\Rymd
-          OutputBaseFilename=rymd-${{ github.ref_name }}-setup-x64
+          OutputBaseFilename=rymd-${{ env.RYMD_VERSION }}-setup-x64
           OutputDir=.
           Compression=lzma2
           SolidCompression=yes
@@ -114,9 +118,24 @@ jobs:
           Set-Content -Path rymd.iss -Value $iss
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rymd.iss
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: windows-release
+          path: |
             rymd-*-windows-x64.zip
             rymd-*-setup-x64.exe
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish to tag
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
