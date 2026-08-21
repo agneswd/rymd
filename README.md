@@ -51,6 +51,32 @@ On Windows, MSVC or MinGW both work; the platform layer uses
 RYMD_TAB=duplicates ./target/release/rymd .  # start on the duplicates tab
 ```
 
+## Updates
+
+Rymd checks GitHub Releases for a newer stable version once per launch,
+just after the window opens. The check never blocks startup, and it stays
+silent when it fails, so running Rymd offline is completely normal.
+
+When a newer release exists, Rymd offers to update. It downloads the
+artifact for your installation in the background, verifies its SHA-256
+against the `SHA256SUMS` published with the release, and only then restarts
+into it. An artifact that fails verification is never run.
+
+| Installation | Update path |
+| --- | --- |
+| Windows installer | Re-runs the installer, which asks for elevation if needed |
+| Windows portable `.exe` | Replaces the binary next to itself and restarts |
+| Linux AppImage | Replaces the AppImage and restarts |
+| Distribution package, tarball, `cargo build` | Opens the release page; files are never replaced behind a package manager |
+
+Check manually from the toolbar overflow menu: **... -> Check for
+updates**. A manual check reports its result either way; the startup check
+only speaks when there is an update.
+
+Set `RYMD_NO_UPDATE_CHECK=1` to disable update checks entirely.
+
+Release procedure and artifact naming: [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Platform notes
 
 | Concern        | Linux                     | Windows                       |
