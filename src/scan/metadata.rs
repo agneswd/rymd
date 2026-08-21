@@ -49,8 +49,8 @@ pub fn platform() -> &'static dyn PlatformFilesystem {
     {
         &super::platform::linux::LinuxFilesystem
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     {
-        compile_error!("rymd currently ships with a Linux platform implementation only");
+        &super::platform::windows::WindowsFilesystem
     }
 }

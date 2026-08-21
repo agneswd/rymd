@@ -42,7 +42,7 @@ fn dev_of(md: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(md.dev())
 }
-#[cfg(windows)]
+#[cfg(not(unix))]
 fn dev_of(_: &std::fs::Metadata) -> Option<u64> {
     None
 }
@@ -52,9 +52,11 @@ fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(md.ino())
 }
-#[cfg(windows)]
-fn ino_of(_: &std::fs::Metadata) -> Option<u64> {
-    None
+#[cfg(not(unix))]
+fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
+    // No stable file index without opening a handle here; fall back to a
+    // weak identity so verification still catches renames and rewrites.
+    Some(md.len())
 }
 
 /// Never allow these targets to be deleted.

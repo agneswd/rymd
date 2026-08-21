@@ -2,24 +2,34 @@
 name = "rymd"
 version = "0.1.0"
 edition = "2024"
+description = "A calm disk usage visualizer for Windows and Linux"
 
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
 
 anyhow = "1"
 blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 crossbeam-channel = "0.5"
 directories = "6"
 parking_lot = "0.12"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
+smol = "2"
 thiserror = "2"
 trash = "5"
-chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
-libc = "0.2.189"
-smol = "2.0.2"
-gpui-component-assets = "0.5.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_Foundation",
+  "Win32_Security",
+] }
 
 [profile.dev]
 debug = "limited"
@@ -29,3 +39,7 @@ resvg = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
