@@ -33,6 +33,8 @@ jobs:
                    AppDir/usr/share/applications
           cp target/release/rymd AppDir/usr/bin/
           cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/rymd.png
+          cp assets/icon.png AppDir/rymd.png
+          cp assets/rymd.svg AppDir/rymd.svg
           cat > AppDir/rymd.desktop <<'DESKTOP'
           [Desktop Entry]
           Type=Application
