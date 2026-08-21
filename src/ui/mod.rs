@@ -1,3 +1,4 @@
+pub mod duplicate_table;
 pub mod file_table;
 pub mod menus;
 pub mod shell;

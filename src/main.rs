@@ -7,6 +7,7 @@ use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 mod actions;
+mod duplicates;
 
 mod model;
 mod scan;

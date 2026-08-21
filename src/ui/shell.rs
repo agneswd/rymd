@@ -33,6 +33,7 @@ use crate::scan::options::{ScanOptions, SizeMetric};
 use crate::scan::progress::ScanProgress;
 use crate::scan::scanner::{CancelHandle, ScanLive, ScanOutcome};
 use crate::state::{AppTab, AppState, ScanState};
+use crate::ui::duplicate_table::DuplicatesDelegate;
 use crate::ui::file_table::FileTableDelegate;
 use crate::util::format_size::{format_count, format_size};
 
@@ -44,6 +45,7 @@ pub struct AppShell {
 
     pub filter_input: Entity<InputState>,
     pub table: Entity<TableState<FileTableDelegate>>,
+    pub dup_table: Entity<TableState<DuplicatesDelegate>>,
 
     pub focus_handle: FocusHandle,
     pub window_handle: AnyWindowHandle,
@@ -67,6 +69,10 @@ impl AppShell {
                 .col_resizable(true)
                 .sortable(true)
                 .row_selectable(true)
+        });
+        let dup_delegate = DuplicatesDelegate::new();
+        let dup_table = cx.new(|cx| {
+            TableState::new(dup_delegate, window, cx).col_resizable(true)
         });
 
         // Table events drive selection and navigation.
@@ -99,13 +105,19 @@ impl AppShell {
         // Receive global shortcuts without clicking first.
         window.focus(&focus_handle);
 
+        let mut state = AppState::default();
+        if std::env::var("RYMD_TAB").as_deref() == Ok("duplicates") {
+            state.active_tab = crate::state::AppTab::Duplicates;
+        }
+
         Self {
-            state: AppState::default(),
+            state,
             model: None,
             scan_job: None,
             progress: ScanProgress::default(),
             filter_input,
             table,
+            dup_table,
             focus_handle,
             window_handle: window.window_handle(),
             ui_scale: 1.0,
@@ -118,6 +130,10 @@ impl AppShell {
         self.scan_job = None;
         self.model = None;
         self.progress = ScanProgress::default();
+        self.dup_table.update(cx, |t, _| {
+            t.delegate_mut().clear_selection();
+            t.delegate_mut().set_groups(&[], &Default::default());
+        });
         let started = Instant::now();
         self.state = AppState::default();
         self.state.scan = ScanState::Scanning { started };
@@ -183,6 +199,9 @@ impl AppShell {
                 });
                 // Land the view on the scan root.
                 self.state.current_node = Some(NodeId(0));
+                if self.state.active_tab == crate::state::AppTab::Duplicates {
+                    self.ensure_duplicates(cx);
+                }
             }
         }
         cx.notify();
@@ -330,8 +349,289 @@ impl AppShell {
         self.activate_node(node, cx);
     }
 
-    // ---- deletion --------------------------------------------------------
+    // ---- duplicates ------------------------------------------------------
 
+    fn refresh_dup_rows(&mut self, cx: &mut Context<Self>) {
+        let groups = self.state.duplicates.as_ref().map(|d| d.groups.clone());
+        if let Some(groups) = groups {
+            self.dup_table.update(cx, |t, _| {
+                let selected = t.delegate().selected().clone();
+                t.delegate_mut().set_groups(&groups, &selected);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_dup_select(&mut self, node: NodeId, checked: bool, cx: &mut Context<Self>) {
+        self.dup_table.update(cx, |t, _| {
+            t.delegate_mut().set_selected(node, checked);
+        });
+        self.refresh_dup_rows(cx);
+    }
+
+    pub fn toggle_dup_group(&mut self, group_ix: usize, checked: bool, cx: &mut Context<Self>) {
+        let nodes: Vec<NodeId> = self
+            .state
+            .duplicates
+            .as_ref()
+            .and_then(|d| d.groups.get(group_ix))
+            .map(|g| g.files.iter().map(|f| f.node_id).collect())
+            .unwrap_or_default();
+        if nodes.is_empty() {
+            return;
+        }
+        self.dup_table.update(cx, |t, _| {
+            for n in nodes {
+                t.delegate_mut().set_selected(n, checked);
+            }
+        });
+        self.refresh_dup_rows(cx);
+    }
+
+    /// Kick off duplicate detection when the tab is first opened.
+    pub fn ensure_duplicates(&mut self, cx: &mut Context<Self>) {
+        if self.state.duplicates.is_some() || self.state.duplicates_computing {
+            return;
+        }
+        let Some(model) = &self.model else { return };
+        self.state.duplicates_computing = true;
+        cx.notify();
+
+        // Snapshot candidates on the UI thread; hashing runs without it.
+        let candidates = crate::duplicates::finder::collect_candidates(&model.read());
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+
+        cx.spawn(async move |this, cx| {
+            let task = smol::unblock(move || {
+                let progress = crate::duplicates::FinderProgress {
+                    files_scanned: std::sync::atomic::AtomicU64::new(0),
+                };
+                crate::duplicates::finder::detect(candidates, &flag, &progress)
+            });
+            let groups = task.await;
+            this.update(cx, move |shell, cx| {
+                shell.state.duplicates_computing = false;
+                shell.state.duplicates = Some(crate::state::DuplicatesState {
+                    groups,
+                    selected: Default::default(),
+                });
+                shell.refresh_dup_rows(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Any model mutation invalidates the cached duplicate report.
+    fn invalidate_duplicates(&mut self) {
+        self.state.duplicates = None;
+        self.state.duplicates_computing = false;
+    }
+
+    /// (node ids, bytes) of ticked files that still exist in groups.
+    pub(crate) fn dup_selection(&self, cx: &Context<Self>) -> (Vec<NodeId>, u64) {
+        let Some(ds) = &self.state.duplicates else { return (Vec::new(), 0) };
+        let selected = self.dup_table.read(cx).delegate().selected();
+        let mut nodes = Vec::new();
+        let mut bytes = 0u64;
+        for g in &ds.groups {
+            for f in &g.files {
+                if selected.contains(&f.node_id) && !f.hard_linked {
+                    nodes.push(f.node_id);
+                    bytes += g.size;
+                }
+            }
+        }
+        (nodes, bytes)
+    }
+
+    fn collect_dup_targets(&self, cx: &Context<Self>) -> Vec<DupTarget> {
+        let Some(model) = &self.model else { return Vec::new() };
+        let m = model.read();
+        let Some(ds) = &self.state.duplicates else { return Vec::new() };
+        let selected = self.dup_table.read(cx).delegate().selected();
+        let mut out = Vec::new();
+        for g in &ds.groups {
+            for f in &g.files {
+                if !selected.contains(&f.node_id) || f.hard_linked {
+                    continue;
+                }
+                if let Ok(md) = std::fs::symlink_metadata(&f.path) {
+                    #[cfg(unix)]
+                    let (dev, ino) = {
+                        use std::os::unix::fs::MetadataExt;
+                        (md.dev(), md.ino())
+                    };
+                    #[cfg(not(unix))]
+                    let (dev, ino) = (0u64, 0u64);
+                    out.push(DupTarget {
+                        node: f.node_id,
+                        path: f.path.clone(),
+                        kind: m.node(f.node_id).kind(),
+                        size: g.size,
+                        dev,
+                        inode: ino,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    pub fn confirm_trash_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.collect_dup_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let count = targets.len();
+        let bytes: u64 = targets.iter().map(|t| t.size).sum();
+        let body = format!(
+            "Move these {} items to Trash?\n\n{} total\n\nSpace is reclaimed once the Trash is emptied.",
+            format_count(count as u64),
+            format_size(bytes)
+        );
+        let weak = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Move duplicates to Trash?")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Move to Trash")
+                        .cancel_text("Cancel"),
+                )
+                .child(div().max_w(px(420.)).child(body.clone()))
+                .on_ok({
+                    let w = weak.clone();
+                    let targets = targets.clone();
+                    move |_, _, cx| {
+                        let _ =
+                            w.update(cx, |shell, cx| shell.batch_remove_duplicates(targets.clone(), false, cx));
+                        false
+                    }
+                })
+        });
+    }
+
+    pub fn confirm_delete_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.collect_dup_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let count = targets.len();
+        let bytes: u64 = targets.iter().map(|t| t.size).sum();
+        let body = format!(
+            "Permanently delete these {} items?\n\n{} total\n\nThis cannot be undone.",
+            format_count(count as u64),
+            format_size(bytes)
+        );
+        let weak = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Delete duplicates permanently?")
+                .alert()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete permanently")
+                        .cancel_text("Cancel")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .child(div().max_w(px(420.)).child(body.clone()))
+                .on_ok({
+                    let w = weak.clone();
+                    let targets = targets.clone();
+                    move |_, _, cx| {
+                        let _ =
+                            w.update(cx, |shell, cx| shell.batch_remove_duplicates(targets.clone(), true, cx));
+                        false
+                    }
+                })
+        });
+    }
+
+    /// One background pass over every ticked duplicate, with per-file
+    /// identity verification so nothing stale is touched.
+    fn batch_remove_duplicates(
+        &mut self,
+        mut targets: Vec<DupTarget>,
+        permanent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        // Keep only the first path per inode: deleting several links of one
+        // file would reclaim nothing anyway.
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert((t.dev, t.inode)));
+
+        let task = smol::unblock(move || {
+            let mut removed = Vec::new();
+            let mut failures: Vec<(std::path::PathBuf, String)> = Vec::new();
+            for t in targets {
+                if !crate::actions::fs_ops::verify_identity(&t.path, t.dev, t.inode, t.kind) {
+                    continue; // changed since scan; skip silently but report below
+                }
+                let res = if permanent {
+                    crate::actions::fs_ops::delete_permanently(&t.path, t.kind)
+                } else {
+                    crate::actions::fs_ops::move_to_trash(&t.path)
+                };
+                match res {
+                    Ok(()) => removed.push(t),
+                    Err(e) => failures.push((t.path, e.to_string())),
+                }
+            }
+            (removed, failures)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let (removed, failures) = task.await;
+            let removed_count = removed.len();
+            this.update(cx, move |shell, cx| {
+                for t in removed {
+                    shell.apply_deletion_and_refresh(t.node, cx);
+                }
+                shell.invalidate_duplicates();
+                shell.dup_table.update(cx, |t, _| t.delegate_mut().clear_selection());
+                let verb = if permanent { "deleted" } else { "moved to Trash" };
+                let msg = if failures.is_empty() {
+                    format!("{removed_count} items {verb}")
+                } else {
+                    format!(
+                        "{} items {}, {} failed",
+                        removed_count,
+                        verb,
+                        failures.len()
+                    )
+                };
+                let kind = if failures.is_empty() {
+                    NotificationType::Success
+                } else {
+                    NotificationType::Warning
+                };
+                shell.notify(kind, &msg, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// One ticked duplicate queued for removal.
+#[derive(Clone)]
+pub struct DupTarget {
+    pub node: NodeId,
+    pub path: PathBuf,
+    pub kind: crate::model::NodeKind,
+    pub size: u64,
+    pub dev: u64,
+    pub inode: u64,
+}
+impl AppShell {
     /// Confirmation dialog before moving to Trash. Trash is recoverable,
     /// but it is still a removal, so it always asks first.
     pub fn confirm_trash(&mut self, node: NodeId, window: &mut Window, cx: &mut Context<Self>) {
@@ -401,7 +701,9 @@ impl AppShell {
                     shell.apply_deletion_and_refresh(node, cx);
                     shell.notify(
                         NotificationType::Success,
-                        &format!("Moved to Trash: {name}. Space is reclaimed once Trash is emptied."),
+                        &format!(
+                            "Moved to Trash: {name}. Space is reclaimed once Trash is emptied."
+                        ),
                         cx,
                     );
                 }
@@ -465,14 +767,13 @@ impl AppShell {
             self.warn_changed(cx);
             return;
         }
-        let (name, items, size, _path) = {
+        let (name, items, size) = {
             let m = model.read();
             let n = m.node(node);
             (
                 n.name.to_string_lossy().into_owned(),
-                n.file_count + n.dir_count - 1, // exclude the directory itself
+                n.file_count + n.dir_count - 1,
                 n.agg_allocated,
-                m.path_of(node),
             )
         };
         let body = format!(
@@ -485,7 +786,7 @@ impl AppShell {
 
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
-                .title(format!("Clear {}?", name))
+                .title(format!("Clear {name}?"))
                 .alert()
                 .button_props(
                     DialogButtonProps::default()
@@ -540,15 +841,13 @@ impl AppShell {
             let result = task.await;
             this.update(cx, move |shell, cx| match result {
                 Ok((count, _bytes)) => {
-                    // Children vanished on disk: rescan just this subtree by
-                    // refreshing views with adjusted numbers is not enough.
-                    // Mark the whole directory stale so the user can rescan.
+                    shell.refresh_after_clear(node, cx);
+                    shell.invalidate_duplicates();
                     shell.notify(
                         NotificationType::Success,
                         &format!("Removed {} items. Rescan to refresh sizes.", count),
                         cx,
                     );
-                    shell.refresh_after_clear(node, cx);
                 }
                 Err(e) => shell.notify(
                     NotificationType::Error,
@@ -561,8 +860,7 @@ impl AppShell {
         .detach();
     }
 
-    /// Remove every child of `node` from the model (they were deleted on
-    /// disk by `clear_directory`).
+    /// Remove every child of `node` from the model after a disk-side clear.
     fn refresh_after_clear(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let Some(model) = &self.model else { return };
         {
@@ -593,6 +891,7 @@ impl AppShell {
         }
 
         self.state.selected_node = None;
+        self.invalidate_duplicates();
         self.table.update(cx, |t, _| t.delegate_mut().rebuild_rows());
         cx.notify();
     }
@@ -631,6 +930,9 @@ impl AppShell {
     pub fn toggle_tab(&mut self, tab: AppTab, cx: &mut Context<Self>) {
         if self.state.active_tab != tab {
             self.state.active_tab = tab;
+            if tab == AppTab::Duplicates {
+                self.ensure_duplicates(cx);
+            }
             cx.notify();
         }
     }
@@ -663,24 +965,30 @@ impl AppShell {
             .map(|i| (i.path.to_string_lossy().into_owned(), i.error.clone()))
             .collect();
         window.open_sheet(cx, move |sheet, _, _| {
-            sheet.title("Unreadable paths").child(div().flex().flex_col().gap_2().children(
-                issues.iter().map(|(p, e)| {
+            sheet
+                .title("Unreadable paths")
+                .child(
                     div()
-                        .border_b_1()
-                        .border_color(gpui::black().opacity(0.08))
-                        .py_1()
-                        .child(
-                            v_flex()
-                                .child(div().text_size(px(12.)).truncate().child(p.clone()))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(issues.iter().map(|(p, e)| {
+                            div()
+                                .border_b_1()
+                                .border_color(gpui::black().opacity(0.08))
+                                .py_1()
                                 .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(gpui::red())
-                                        .child(e.clone()),
-                                ),
-                        )
-                }),
-            ))
+                                    v_flex()
+                                        .child(div().text_size(px(12.)).truncate().child(p.clone()))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(gpui::red())
+                                                .child(e.clone()),
+                                        ),
+                                )
+                        })),
+                )
         });
     }
 

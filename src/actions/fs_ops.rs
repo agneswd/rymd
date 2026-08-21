@@ -14,12 +14,18 @@ use crate::model::{NodeId, NodeKind, ScanModel};
 /// after the scan ran.
 pub fn verify_unchanged(model: &ScanModel, node: NodeId) -> bool {
     let n = model.node(node);
-    let path = model.path_of(node);
-    match std::fs::symlink_metadata(&path) {
+    verify_identity(&model.path_of(node), n.device, n.inode, n.kind)
+}
+
+/// Confirm `path` still refers to the recorded object. Used both right
+/// after a scan (via [`verify_unchanged`]) and inside batch jobs that
+/// cannot hold a model reference.
+pub fn verify_identity(path: &Path, device: u64, inode: u64, kind: NodeKind) -> bool {
+    match std::fs::symlink_metadata(path) {
         Ok(md) => {
-            let dev_ok = dev_of(&md) == Some(n.device);
-            let ino_ok = ino_of(&md) == Some(n.inode);
-            let kind_ok = match n.kind {
+            let dev_ok = dev_of(&md) == Some(device);
+            let ino_ok = ino_of(&md) == Some(inode);
+            let kind_ok = match kind {
                 NodeKind::Directory => md.is_dir(),
                 NodeKind::File => md.is_file(),
                 NodeKind::Symlink => md.is_symlink(),

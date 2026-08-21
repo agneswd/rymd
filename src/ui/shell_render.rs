@@ -465,24 +465,137 @@ impl AppShell {
             )
     }
 
-    fn render_duplicates_placeholder(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_duplicates_placeholder(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        v_flex()
+
+        if self.state.duplicates_computing {
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(Spinner::new())
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("Hashing candidate files..."),
+                )
+                .into_any_element();
+        }
+
+        let Some(ds) = &self.state.duplicates else {
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("Find copies of the same file by size, then BLAKE3 content hashes."),
+                )
+                .child(
+                    Button::new("find-dups")
+                        .primary()
+                        .label("Find duplicate files")
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            this.ensure_duplicates(cx);
+                        })),
+                )
+                .into_any_element();
+        };
+
+        if ds.groups.is_empty() {
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("No duplicate files found above 1 MiB."),
+                )
+                .into_any_element();
+        }
+
+        let (sel_nodes, sel_bytes) = self.dup_selection(cx);
+        let sel_count = sel_nodes.len();
+        let mut col = v_flex().flex_1().min_h_0();
+
+        if sel_count > 0 {
+            col = col.child(
+                h_flex()
+                    .px_2()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div().text_sm().font_weight(gpui::FontWeight::MEDIUM).child(
+                            SharedString::from(format!(
+                                "{} selected · {}",
+                                format_count(sel_count as u64),
+                                crate::util::format_size::format_size(sel_bytes)
+                            )),
+                        ),
+                    )
+                    .flex_1(),
+            );
+        }
+
+        let table_el = div()
             .flex_1()
-            .items_center()
-            .justify_center()
+            .min_h_0()
+            .overflow_hidden()
+            .child(Table::new(&self.dup_table).stripe(false))
+            .into_any_element();
+        col = col.child(table_el);
+
+        let mut footer = h_flex()
+            .px_2()
+            .py_1p5()
             .gap_2()
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("Duplicate file finder lands after the file browser stabilizes."),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("It will group by size, hash with BLAKE3, and reuse the deletion flow."),
-            )
+            .items_center()
+            .border_t_1()
+            .border_color(theme.border);
+
+        let total_groups = ds.groups.len();
+        let reclaimable: u64 = ds.groups.iter().map(|g| g.reclaimable).sum();
+        footer = footer.child(
+            div().text_xs().text_color(theme.muted_foreground).child(
+                SharedString::from(format!(
+                    "{} groups · {} reclaimable",
+                    format_count(total_groups as u64),
+                    crate::util::format_size::format_size(reclaimable)
+                )),
+            ),
+        );
+
+        if sel_count > 0 {
+            footer = footer
+                .child(
+                    Button::new("dup-trash")
+                        .outline()
+                        .small()
+                        .label("Move to Trash...")
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                            this.confirm_trash_duplicates(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("dup-delete")
+                        .danger()
+                        .small()
+                        .label("Delete permanently...")
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                            this.confirm_delete_duplicates(window, cx);
+                        })),
+                );
+        }
+
+        col = col.child(footer);
+        col.into_any_element()
     }
 
     fn render_files_split(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {

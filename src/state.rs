@@ -24,7 +24,16 @@ pub struct FilesystemStats {
     pub free_bytes: Option<u64>,
 }
 
+/// Cached duplicate detection result for the current scan.
+pub struct DuplicatesState {
+    pub groups: Vec<crate::duplicates::DuplicateGroup>,
+    /// Node ids selected for deletion.
+    pub selected: std::collections::HashSet<NodeId>,
+}
+
 pub struct AppState {
+    pub duplicates: Option<DuplicatesState>,
+    pub duplicates_computing: bool,
     pub scan: ScanState,
     /// Current directory shown by table and treemap.
     pub current_node: Option<NodeId>,
@@ -50,6 +59,8 @@ impl Default for AppState {
             metric: SizeMetric::DiskUsage,
             filter: String::new(),
             filesystem: None,
+            duplicates: None,
+            duplicates_computing: false,
         }
     }
 }
