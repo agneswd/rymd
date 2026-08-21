@@ -8,9 +8,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, px, AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Point, Size, Stateful, point,
-    StatefulInteractiveElement as _, Styled, WeakEntity, Window,
+    div, point, px, AnyElement, App, Bounds, Element, ElementId, GlobalElementId,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Size,
+    Stateful, StatefulInteractiveElement as _, Styled, WeakEntity, Window,
 };
 use gpui_component::{tooltip::Tooltip, ActiveTheme as _};
 use parking_lot::RwLock;
@@ -38,6 +38,10 @@ pub struct TreemapElement {
     metric: SizeMetric,
     selected: Option<u32>,
     shell: WeakEntity<AppShell>,
+    /// Bumped by the shell whenever inputs behind the weights change
+    /// (navigation, filter, metric, deletions). Part of the cache key so
+    /// look-alike directories can never serve stale rectangles.
+    version: u64,
 }
 
 impl TreemapElement {
@@ -48,19 +52,17 @@ impl TreemapElement {
         metric: SizeMetric,
         selected: Option<u32>,
         shell: WeakEntity<AppShell>,
+        version: u64,
     ) -> Self {
         Self {
-            base: div()
-                .id("treemap")
-                .size_full()
-                .relative()
-                .overflow_hidden(),
+            base: div().id("treemap").size_full().relative().overflow_hidden(),
             items,
             model,
             dir_total,
             metric,
             selected,
             shell,
+            version,
         }
     }
 }
@@ -87,8 +89,7 @@ impl Styled for TreemapElement {
 struct LayoutKey {
     width: f32,
     height: f32,
-    weights_sum: u64,
-    first_weight_bits: u64,
+    version: u64,
 }
 
 #[derive(Default)]
@@ -152,16 +153,22 @@ impl Element for TreemapElement {
         let rects =
             window.with_element_state(global_id.unwrap(), |state: Option<TreemapState>, _| {
                 let mut state = state.unwrap_or_default();
-                let weights_sum: u64 = self.items.iter().map(|i| i.weight as u64).sum();
                 let key = LayoutKey {
                     width,
                     height,
-                    weights_sum,
-                    first_weight_bits: self.items.first().map(|i| i.weight.to_bits()).unwrap_or(0),
+                    version: self.version,
                 };
                 let unchanged = state.key == Some(key);
                 if !unchanged {
-                    state.rects = squarify(&self.items, FRect::new(0., 0., width, height));
+                    state.rects = squarify(
+                        &self.items,
+                        FRect::new(
+                            EDGE_PAD,
+                            EDGE_PAD,
+                            (width - 2.0 * EDGE_PAD).max(0.0),
+                            (height - 2.0 * EDGE_PAD).max(0.0),
+                        ),
+                    );
                     state.key = Some(key);
                 }
 
@@ -352,37 +359,50 @@ impl TreemapElement {
             });
         });
 
-        let dir_total = self.dir_total;
-        let t_name = name.clone();
-        let t_path = path.clone();
+        let data = TooltipData {
+            name: name.clone(),
+            size,
+            items,
+            is_dir,
+            hardlink,
+            mount,
+            dir_total: self.dir_total,
+            path: path.clone(),
+        };
         rect_div = rect_div.tooltip(move |window, cx| {
-            let n2 = t_name.clone();
-            let p2 = t_path.clone();
-            Tooltip::element(move |_, cx| {
-                tooltip_body(
-                    cx, &n2, size, items, is_dir, hardlink, mount, dir_total, &p2,
-                )
-            })
-            .build(window, cx)
+            let data = data.clone();
+            Tooltip::element(move |_, cx| tooltip_body(cx, &data)).build(window, cx)
         });
 
         rect_div.into_any_element()
     }
 }
 
-fn tooltip_body(
-    cx: &gpui::App,
-    name: &str,
+#[derive(Clone)]
+struct TooltipData {
+    name: String,
     size: u64,
     items: u64,
     is_dir: bool,
     hardlink: bool,
     mount: bool,
     dir_total: u64,
-    path: &str,
-) -> gpui::AnyElement {
+    path: String,
+}
+
+fn tooltip_body(cx: &gpui::App, d: &TooltipData) -> gpui::AnyElement {
     use gpui_component::{h_flex, v_flex};
     let theme = cx.theme();
+    let (name, size, items, is_dir, hardlink, mount, dir_total, path) = (
+        &d.name,
+        d.size,
+        d.items,
+        d.is_dir,
+        d.hardlink,
+        d.mount,
+        d.dir_total,
+        &d.path,
+    );
 
     let mut col = v_flex()
         .gap_0p5()

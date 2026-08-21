@@ -5,7 +5,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{div, px, Context, IntoElement, ParentElement as _, SharedString, Styled as _};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
-use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu};
 use gpui_component::resizable::{resizable_panel, v_resizable};
 use gpui_component::spinner::Spinner;
 use gpui_component::tab::{Tab, TabBar};
@@ -614,6 +614,7 @@ impl AppShell {
                 self.state.metric,
                 selected,
                 cx.entity().downgrade(),
+                self.view_version,
             )
             .rounded(px(4.0))
             .border_1()

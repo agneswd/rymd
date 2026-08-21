@@ -108,6 +108,7 @@ impl CancelHandle {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ScanOutcome {
     Completed {
         model: Box<ScanModel>,
@@ -126,11 +127,8 @@ pub struct ScanJob {
 }
 
 fn worker_count() -> usize {
-    thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8)
-        .max(2)
+    let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    cpus.clamp(2, 8)
 }
 
 /// Start scanning `root` on background threads.
@@ -314,12 +312,10 @@ fn process_task(shared: &Shared, options: &ScanOptions, task: DirTask) {
         if md.kind == EntryKind::File && md.nlink > 1 {
             let key = (md.device, md.inode);
             let mut links = shared.hardlinks.lock();
-            if links.contains_key(&key) {
+            if links.insert(key, ()).is_some() {
                 // Storage for this inode was already counted at its first path.
                 flags |= HARDLINK_SHARED;
                 count_bytes = false;
-            } else {
-                links.insert(key, ());
             }
         }
 

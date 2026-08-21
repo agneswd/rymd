@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use crate::model::{NodeId, NodeKind, ScanModel, TOMBSTONED};
 
@@ -71,6 +70,7 @@ pub fn collect_candidates(model: &ScanModel) -> Vec<CandidateFile> {
 /// Run the three-pass detection over a finished scan. Convenience wrapper
 /// used by tests; the UI path snapshots candidates first and calls
 /// [`detect`] off-thread.
+#[allow(dead_code)]
 pub fn find_duplicates(
     model: &ScanModel,
     cancelled: &AtomicBool,
@@ -157,7 +157,7 @@ pub fn detect(
             }
 
             let mut files: Vec<DuplicateFile> = Vec::new();
-            for (_ident, members) in &identities {
+            for members in identities.values() {
                 let shared = members.len() > 1;
                 for (ix, id) in members.iter().enumerate() {
                     files.push(DuplicateFile {
@@ -185,7 +185,7 @@ pub fn detect(
         }
     }
 
-    out.sort_by(|a, b| b.reclaimable.cmp(&a.reclaimable));
+    out.sort_by_key(|g| std::cmp::Reverse(g.reclaimable));
     out
 }
 
@@ -212,8 +212,8 @@ mod tests {
         }
     }
 
-    fn scan(p: &PathBuf) -> ScanModel {
-        match spawn_scan(p.clone(), ScanOptions::default())
+    fn scan(p: &std::path::Path) -> ScanModel {
+        match spawn_scan(p.to_path_buf(), ScanOptions::default())
             .rx
             .recv_timeout(Duration::from_secs(30))
             .unwrap()

@@ -70,8 +70,8 @@ fn main() {
         .unwrap();
 
         // Optional immediate scan: `rymd /some/dir`
-        if let Some(path) = initial_path {
-            if path.is_dir() {
+        if let Some(path) = initial_path.filter(|p| p.is_dir()) {
+            {
                 if let Some(shell) = shell_handle.take() {
                     if let Err(e) = shell.update(cx, |sh, cx| sh.start_scan(path, cx)) {
                         eprintln!("rymd: initial scan kick failed: {e}");

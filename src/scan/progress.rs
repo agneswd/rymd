@@ -4,6 +4,7 @@
 /// sends one message per discovered file.
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 #[derive(Default, Clone, Debug)]
 pub struct ScanProgress {
     pub files_seen: u64,

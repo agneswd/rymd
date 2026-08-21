@@ -1,7 +1,7 @@
 /// Human-readable byte sizes and counts.
 ///
 /// All formatters take plain numbers so they can be tested without a scan model.
-
+///
 /// Format bytes using binary units (1 KB = 1024 B), which matches how
 /// disk analyzers report allocated space.
 pub fn format_size(bytes: u64) -> String {
@@ -28,7 +28,7 @@ pub fn format_count(n: u64) -> String {
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     let len = s.len();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

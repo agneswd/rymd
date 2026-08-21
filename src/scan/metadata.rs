@@ -33,10 +33,12 @@ pub struct FileMetadata {
 
 /// Identifies the filesystem containing a path (`st_dev` on Linux,
 /// volume serial number on Windows).
+#[allow(dead_code)]
 pub type FilesystemId = u64;
 
 /// Platform boundary for the scanner. All methods use lstat semantics:
 /// symlinks are described by their own metadata, never by their target.
+#[allow(dead_code)]
 pub trait PlatformFilesystem: Send + Sync {
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
     fn filesystem_id(&self, path: &Path) -> io::Result<FilesystemId>;

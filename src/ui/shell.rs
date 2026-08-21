@@ -51,6 +51,8 @@ pub struct AppShell {
     pub window_handle: AnyWindowHandle,
     /// UI scale factor applied through the rem size.
     pub ui_scale: f32,
+    /// Monotonic counter invalidating cached derived views (treemap layout).
+    pub view_version: u64,
 }
 
 pub struct ActiveScan {
@@ -88,6 +90,7 @@ impl AppShell {
             if let InputEvent::Change = event {
                 let text = this.filter_input.read(cx).value().to_string();
                 this.state.filter = text.clone();
+                this.view_version += 1;
                 this.table.update(cx, |t, _| t.delegate_mut().set_filter(text));
                 cx.notify();
             }
@@ -121,6 +124,7 @@ impl AppShell {
             focus_handle,
             window_handle: window.window_handle(),
             ui_scale: 1.0,
+            view_version: 1,
         }
     }
 
@@ -215,10 +219,10 @@ impl AppShell {
             prompt: None,
         });
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = picker.await {
-                if let Some(path) = paths.into_iter().next() {
-                    this.update(cx, |shell, cx| shell.start_scan(path, cx)).ok();
-                }
+            if let Ok(Ok(Some(paths))) = picker.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |shell, cx| shell.start_scan(path, cx)).ok();
             }
         })
         .detach();
@@ -247,6 +251,7 @@ impl AppShell {
 
     fn set_current_dir(&mut self, node: NodeId, cx: &mut Context<Self>) {
         self.state.current_node = Some(node);
+        self.view_version += 1;
         self.table.update(cx, |t, _| t.delegate_mut().set_directory(node));
         cx.notify();
     }
@@ -290,8 +295,7 @@ impl AppShell {
             .unwrap_or(false);
         if kind_is_dir {
             self.navigate_to(node, cx);
-        } else if let (Some(model), Some(window_cx)) = (&self.model, None::<()>) {
-            let _ = window_cx;
+        } else if let Some(model) = &self.model {
             let path = model.read().path_of(node);
             cx.open_with_system(&path);
         }
@@ -313,11 +317,11 @@ impl AppShell {
     }
 
     fn on_table_select(&mut self, row: usize, cx: &mut Context<Self>) {
-        if let Some(&n) = self.table.read(cx).delegate().rows.get(row) {
-            if self.state.selected_node != Some(n) {
-                self.state.selected_node = Some(n);
-                cx.notify();
-            }
+        if let Some(&n) = self.table.read(cx).delegate().rows.get(row)
+            && self.state.selected_node != Some(n)
+        {
+            self.state.selected_node = Some(n);
+            cx.notify();
         }
     }
 
@@ -345,6 +349,7 @@ impl AppShell {
         }
     }
 
+    #[allow(dead_code)] // menu parity for future direct-open entries
     pub fn open_node(&mut self, node: NodeId, cx: &mut Context<Self>) {
         self.activate_node(node, cx);
     }
@@ -891,6 +896,7 @@ impl AppShell {
         }
 
         self.state.selected_node = None;
+        self.view_version += 1;
         self.invalidate_duplicates();
         self.table.update(cx, |t, _| t.delegate_mut().rebuild_rows());
         cx.notify();
@@ -922,6 +928,7 @@ impl AppShell {
     pub fn set_metric(&mut self, metric: SizeMetric, cx: &mut Context<Self>) {
         if self.state.metric != metric {
             self.state.metric = metric;
+            self.view_version += 1;
             self.table.update(cx, |t, _| t.delegate_mut().set_metric(metric));
             cx.notify();
         }

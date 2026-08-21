@@ -5,7 +5,7 @@
 //! unit tested against temporary directories.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::{NodeId, NodeKind, ScanModel};
 
@@ -92,23 +92,36 @@ pub fn delete_permanently(path: &Path, kind: NodeKind) -> io::Result<()> {
 }
 
 /// Remove every entry inside `dir`, keeping the directory itself.
-/// Returns (files_removed, bytes_estimated).
+/// Iterative so pathological nesting cannot overflow the stack.
+/// Returns (entries_removed, bytes_estimated).
 pub fn clear_directory(dir: &Path) -> io::Result<(u64, u64)> {
     let mut count = 0u64;
     let mut bytes = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let md = std::fs::symlink_metadata(&path)?;
+    // Post-order walk: deepest children are removed before their parents.
+    let mut pending = vec![dir.to_path_buf()];
+    let mut stack: Vec<(PathBuf, bool)> = Vec::new(); // (path, is_dir)
+    while let Some(current) = pending.pop() {
+        let md = std::fs::symlink_metadata(&current)?;
         if md.is_dir() && !md.is_symlink() {
-            let (c, b) = clear_directory(&path)?;
-            count += c;
-            bytes += b;
-            std::fs::remove_dir(&path)?;
+            for entry in std::fs::read_dir(&current)? {
+                pending.push(entry?.path());
+            }
+            // The directory itself stays; only its descendants get removed.
+            if current != *dir {
+                stack.push((current, true));
+            }
         } else {
             bytes += md.len();
-            std::fs::remove_file(&path)?;
+            stack.push((current, false));
         }
+    }
+    while let Some((path, is_dir)) = stack.pop() {
+        let res = if is_dir {
+            std::fs::remove_dir(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        res?;
         count += 1;
     }
     Ok((count, bytes))

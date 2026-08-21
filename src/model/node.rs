@@ -23,6 +23,7 @@ pub enum NodeKind {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // fields mirror on-disk metadata; not every consumer reads all
 pub struct Node {
     pub parent: Option<NodeId>,
     pub name: std::ffi::OsString,

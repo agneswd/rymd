@@ -13,6 +13,7 @@ pub struct FRect {
     pub h: f32,
 }
 
+#[allow(dead_code)]
 impl FRect {
     pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
@@ -186,7 +187,7 @@ mod tests {
         let it = items(&[500, 300, 150, 40, 10]);
         let out = rects(&it, 640.0, 480.0);
         assert_eq!(out.len(), 5);
-        let bounds = (640.0 * 480.0) as f64;
+        let bounds = 640.0 * 480.0;
         assert!((total_area(&out) - bounds).abs() < bounds * 0.001);
     }
 

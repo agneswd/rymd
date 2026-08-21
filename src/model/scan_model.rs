@@ -17,6 +17,7 @@ pub struct ScanIssue {
 
 /// The full result of a scan. Immutable after completion except for
 /// deletion updates applied through [`ScanModel::apply_deletion`].
+#[allow(dead_code)] // totals()/children()/... are part of the model API used by tests and future views
 #[derive(Debug)]
 pub struct ScanModel {
     pub root_path: PathBuf,
@@ -31,6 +32,7 @@ pub struct ScanModel {
     pub was_cancelled: bool,
 }
 
+#[allow(dead_code)]
 impl ScanModel {
     pub(crate) fn new(root_path: PathBuf, root_device: u64) -> Self {
         Self {

@@ -12,6 +12,7 @@ pub enum AppTab {
     Duplicates,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum ScanState {
     Idle,
@@ -25,6 +26,7 @@ pub struct FilesystemStats {
 }
 
 /// Cached duplicate detection result for the current scan.
+#[allow(dead_code)]
 pub struct DuplicatesState {
     pub groups: Vec<crate::duplicates::DuplicateGroup>,
     /// Node ids selected for deletion.

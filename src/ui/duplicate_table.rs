@@ -127,14 +127,14 @@ impl TableDelegate for DuplicatesDelegate {
         col_ix: usize,
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
-    ) -> gpui::AnyElement {
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let Some(row) = self.rows.get(row_ix) else {
             return div().into_any_element();
         };
 
         match (row, col_ix) {
-            (DupRow::Group { group_ix, .. }, 0) => {
+            (DupRow::Group { .. }, 0) => {
                 let (group_ix, checked) = match row {
                     DupRow::Group {
                         group_ix,
