@@ -7,11 +7,49 @@ on:
 permissions:
   contents: write
 
+# Release artifact naming. The in-app updater looks these names up
+# verbatim, so they must stay in step with `InstallKind::asset_name` in
+# `src/update/installer.rs`:
+#
+#   rymd-<tag>-linux-x86_64.AppImage        self-updating Linux build
+#   rymd-<tag>-linux-x86_64.tar.gz          portable Linux archive
+#   rymd-<tag>-windows-x86_64.exe           portable Windows binary
+#   rymd-<tag>-windows-x86_64-setup.exe     Windows installer
+#   SHA256SUMS                              digests of everything above
+#
+# `SHA256SUMS` is mandatory: the updater refuses to install an artifact it
+# cannot verify. See docs/RELEASING.md.
 env:
   RYMD_VERSION: ${{ github.ref_name }}
 
 jobs:
+  # The updater compares the release tag against the version Cargo reports,
+  # so a tag that disagrees with Cargo.toml must never reach a release.
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      cargo_version: ${{ steps.check.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the tag matches the Cargo version
+        id: check
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')"
+          tag_version="${RYMD_VERSION#v}"
+          echo "Cargo.toml: $cargo_version"
+          echo "Tag:        $tag_version (CARGO_PKG_VERSION must equal this)"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Cargo.toml says $cargo_version but the tag says $tag_version." \
+                 "Bump Cargo.toml and re-tag; otherwise the updater offers the wrong version."
+            exit 1
+          fi
+          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +64,9 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-cursor-dev libvulkan-dev libudev-dev \
             cmake clang build-essential curl file
+
+      - name: Test
+        run: cargo test --release
 
       - name: Build release binary
         run: cargo build --release
@@ -53,56 +94,71 @@ jobs:
           curl -fsSL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
-          ./appimagetool AppDir rymd-${{ env.RYMD_VERSION }}-x86_64.AppImage
+          ./appimagetool AppDir rymd-${{ env.RYMD_VERSION }}-linux-x86_64.AppImage
 
       - name: Tarball
         run: |
           mkdir -p pkg/rymd-${{ env.RYMD_VERSION }}
           cp target/release/rymd pkg/rymd-${{ env.RYMD_VERSION }}/
-          cp README.md LICENSE pkg/rymd-${{ env.RYMD_VERSION }}/ || true
-          tar -C pkg -czf rymd-${{ env.RYMD_VERSION }}-x86_64.tar.gz .
+          cp README.md LICENSE pkg/rymd-${{ env.RYMD_VERSION }}/
+          tar -C pkg -czf rymd-${{ env.RYMD_VERSION }}-linux-x86_64.tar.gz .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-release
           path: |
-            rymd-*-x86_64.AppImage
-            rymd-*-x86_64.tar.gz
+            rymd-${{ env.RYMD_VERSION }}-linux-x86_64.AppImage
+            rymd-${{ env.RYMD_VERSION }}-linux-x86_64.tar.gz
+          if-no-files-found: error
 
   windows:
+    needs: version
     runs-on: windows-latest
+    env:
+      CARGO_VERSION: ${{ needs.version.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Test
+        run: cargo test --release
+
       - name: Build release binary
         run: cargo build --release
 
-      - name: Zip portable build
+      - name: Portable binary
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/rymd.exe dist/
-          Copy-Item README.md dist/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist/* `
-            -DestinationPath rymd-${{ env.RYMD_VERSION }}-windows-x64.zip
+          Copy-Item target/release/rymd.exe `
+            rymd-${{ env.RYMD_VERSION }}-windows-x86_64.exe
 
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
           $iss = @"
           [Setup]
+          ; A stable AppId is what lets an update replace the previous
+          ; install instead of adding a second one next to it.
+          AppId={{9B0E5F4C-2D3A-4C61-9E2F-2B7A5C6D1E80}
           AppName=Rymd
-          AppVersion=${{ env.RYMD_VERSION }}
+          AppVersion=${{ env.CARGO_VERSION }}
+          VersionInfoVersion=${{ env.CARGO_VERSION }}
+          AppPublisher=agneswd
+          AppUpdatesURL=https://github.com/agneswd/rymd/releases
           DefaultDirName={autopf}\Rymd
-          OutputBaseFilename=rymd-${{ env.RYMD_VERSION }}-setup-x64
+          UninstallDisplayIcon={app}\rymd.exe
+          OutputBaseFilename=rymd-${{ env.RYMD_VERSION }}-windows-x86_64-setup
           OutputDir=.
           Compression=lzma2
           SolidCompression=yes
           ArchitecturesInstallIn64BitMode=x64compatible
+          ; The in-app updater exits Rymd before starting Setup; this is the
+          ; backstop for anything it missed.
+          CloseApplications=yes
+          RestartApplications=no
 
           [Files]
           Source: "target\release\rymd.exe"; DestDir: "{app}"
@@ -114,6 +170,15 @@ jobs:
           [Tasks]
           Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
             GroupDescription: "Additional icons:"
+
+          [Run]
+          ; Interactive install: offer to start Rymd.
+          Filename: "{app}\rymd.exe"; Description: "Launch Rymd"; \
+            Flags: nowait postinstall skipifsilent
+          ; Silent install driven by the in-app updater: always come back,
+          ; and come back as the user, not as the elevated installer.
+          Filename: "{app}\rymd.exe"; Flags: nowait runasoriginaluser; \
+            Check: WizardSilent
           "@
           Set-Content -Path rymd.iss -Value $iss
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" rymd.iss
@@ -123,8 +188,9 @@ jobs:
         with:
           name: windows-release
           path: |
-            rymd-*-windows-x64.zip
-            rymd-*-setup-x64.exe
+            rymd-${{ env.RYMD_VERSION }}-windows-x86_64.exe
+            rymd-${{ env.RYMD_VERSION }}-windows-x86_64-setup.exe
+          if-no-files-found: error
 
   release:
     needs: [linux, windows]
@@ -135,7 +201,20 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          sha256sum rymd-* | tee SHA256SUMS
+          # Every artifact the updater can install must have a digest.
+          for f in rymd-${{ env.RYMD_VERSION }}-linux-x86_64.AppImage \
+                   rymd-${{ env.RYMD_VERSION }}-windows-x86_64.exe \
+                   rymd-${{ env.RYMD_VERSION }}-windows-x86_64-setup.exe; do
+            grep -q " $f\$" SHA256SUMS || { echo "::error::missing $f"; exit 1; }
+          done
+
       - name: Publish to tag
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          fail_on_unmatched_files: true
