@@ -523,6 +523,7 @@ impl AppShell {
             .into_any_element()
     }
 
+    /// Treemap weights honor the active name filter like the table does.
     fn treemap_inputs(&self) -> (Vec<TreemapItem>, u64, Option<u32>) {
         let Some(model) = &self.model else {
             return (Vec::new(), 0, None);
@@ -534,9 +535,18 @@ impl AppShell {
         let metric = self.state.metric;
         let n = m.node(dir);
         let dir_total = metric.pick(n.agg_logical, n.agg_allocated);
+        let filter = self.state.filter.to_lowercase();
         let items: Vec<TreemapItem> = n
             .children
             .iter()
+            .filter(|&c| {
+                filter.is_empty()
+                    || m.node(*c)
+                        .name
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&filter)
+            })
             .map(|&c| {
                 let cn = m.node(c);
                 TreemapItem {
@@ -628,23 +638,25 @@ impl AppShell {
 }
 
 fn overflow_menu(mut menu: PopupMenu, metric: SizeMetric) -> PopupMenu {
+    use crate::actions::{MetricApparent, MetricDiskUsage, ScanPath};
+
     menu = menu.label("Size metric");
-    menu = menu.item(
-        PopupMenuItem::new("Disk usage")
-            .on_click(|_, _, _| {})
-            .checked(metric == SizeMetric::DiskUsage),
+    menu = menu.menu_with_check(
+        "Disk usage",
+        metric == SizeMetric::DiskUsage,
+        Box::new(MetricDiskUsage),
     );
-    menu = menu.item(
-        PopupMenuItem::new("Apparent size")
-            .on_click(|_, _, _| {})
-            .checked(metric == SizeMetric::Apparent),
+    menu = menu.menu_with_check(
+        "Apparent size",
+        metric == SizeMetric::Apparent,
+        Box::new(MetricApparent),
     );
+
     menu = menu.separator();
-    menu = menu.item(
-        PopupMenuItem::new("Stay on this filesystem")
-            .checked(true)
-            .disabled(true),
-    );
+    menu = menu.label("Quick scan");
+    for (label, path) in quick_scan_presets() {
+        menu = menu.menu(label, Box::new(ScanPath(path)));
+    }
     menu
 }
 

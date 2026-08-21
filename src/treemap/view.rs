@@ -28,7 +28,7 @@ const MIN_VISIBLE: f32 = 3.0;
 /// selection outlines and labels never get clipped.
 const EDGE_PAD: f32 = 4.0;
 /// Hard cap on rendered rectangles so huge folders stay cheap to draw.
-const MAX_RECTS: usize = 2000;
+const MAX_RECTS: usize = 1200;
 
 pub struct TreemapElement {
     base: gpui::Stateful<gpui::Div>,

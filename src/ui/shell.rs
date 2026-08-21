@@ -47,6 +47,8 @@ pub struct AppShell {
 
     pub focus_handle: FocusHandle,
     pub window_handle: AnyWindowHandle,
+    /// UI scale factor applied through the rem size.
+    pub ui_scale: f32,
 }
 
 pub struct ActiveScan {
@@ -106,6 +108,7 @@ impl AppShell {
             table,
             focus_handle,
             window_handle: window.window_handle(),
+            ui_scale: 1.0,
         }
     }
 
@@ -787,13 +790,31 @@ impl AppShell {
         self.set_metric(SizeMetric::Apparent, cx);
     }
 
-    fn on_stay_on_fs(&mut self, _: &StayOnFilesystem, _: &mut Window, cx: &mut Context<Self>) {
-        // Always on in v1; the menu entry documents the behavior.
-        self.notify(
-            NotificationType::Info,
-            "Staying on one filesystem is always enabled.",
-            cx,
-        );
+    fn on_scan_path(&mut self, a: &ScanPath, _: &mut Window, cx: &mut Context<Self>) {
+        let p = a.0.clone();
+        self.start_scan(p, cx);
+    }
+
+    // ---- zoom -------------------------------------------------------------
+
+    fn apply_zoom(&mut self, scale: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui_scale = scale.clamp(0.6, 2.5);
+        window.set_rem_size(px(16.0 * self.ui_scale));
+        cx.notify();
+    }
+
+    fn on_zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        let next = ((self.ui_scale * 1.1) * 10.0).round() / 10.0;
+        self.apply_zoom(next, window, cx);
+    }
+
+    fn on_zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        let next = ((self.ui_scale / 1.1) * 10.0).round() / 10.0;
+        self.apply_zoom(next, window, cx);
+    }
+
+    fn on_zoom_reset(&mut self, _: &ZoomReset, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_zoom(1.0, window, cx);
     }
 }
 
@@ -831,7 +852,10 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_clear_dir_node))
             .on_action(cx.listener(Self::on_metric_disk_usage))
             .on_action(cx.listener(Self::on_metric_apparent))
-            .on_action(cx.listener(Self::on_stay_on_fs))
+            .on_action(cx.listener(Self::on_scan_path))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
             .child(self.render_titlebar(cx))
             .child(self.render_toolbar(cx))
             .child(self.render_summary(cx))

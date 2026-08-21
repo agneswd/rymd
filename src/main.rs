@@ -40,6 +40,10 @@ fn main() {
             KeyBinding::new("shift-delete", DeleteSelected, Some("Rymd")),
             KeyBinding::new("ctrl-c", CopySelectedPath, Some("Rymd")),
             KeyBinding::new("escape", ClearContext, Some("Rymd")),
+            KeyBinding::new("ctrl-equal", ZoomIn, Some("Rymd")),
+            KeyBinding::new("ctrl-plus", ZoomIn, Some("Rymd")),
+            KeyBinding::new("ctrl-minus", ZoomOut, Some("Rymd")),
+            KeyBinding::new("ctrl-0", ZoomReset, Some("Rymd")),
         ]);
 
         cx.on_action(|_: &Quit, cx| cx.quit());

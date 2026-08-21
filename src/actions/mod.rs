@@ -27,9 +27,17 @@ actions!(
         MetricDiskUsage,
         MetricApparent,
         StayOnFilesystem,
-        ClearContext
+        ClearContext,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset
     ]
 );
+
+/// Start scanning an arbitrary path (quick-scan presets).
+#[derive(Action, Clone, PartialEq, Eq)]
+#[action(namespace = rymd, no_json)]
+pub struct ScanPath(pub std::path::PathBuf);
 
 /// Open a specific node (directory navigation / file open).
 #[derive(Action, Clone, PartialEq, Eq)]
