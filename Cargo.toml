@@ -1,0 +1,31 @@
+[package]
+name = "rymd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+anyhow = "1"
+blake3 = "1"
+crossbeam-channel = "0.5"
+directories = "6"
+parking_lot = "0.12"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+trash = "5"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+libc = "0.2.189"
+smol = "2.0.2"
+gpui-component-assets = "0.5.1"
+
+[profile.dev]
+debug = "limited"
+
+[profile.dev.package]
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
