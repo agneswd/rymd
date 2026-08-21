@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use std::path::PathBuf;
 
 use gpui::{px, size, AppContext as _, Application, Bounds, KeyBinding, WindowBounds, WindowOptions};
@@ -15,6 +13,7 @@ mod scan;
 mod state;
 mod treemap;
 mod ui;
+mod update;
 mod util;
 
 use actions::*;
@@ -69,17 +68,22 @@ fn main() {
         )
         .unwrap();
 
-        // Optional immediate scan: `rymd /some/dir`
-        if let Some(path) = initial_path.filter(|p| p.is_dir()) {
+        // Remove an executable a previous Windows update moved aside.
+        update::installer::clean_stale_backup();
+
+        if let Some(shell) = shell_handle {
+            // Optional immediate scan: `rymd /some/dir`
+            if let Some(path) = initial_path.filter(|p| p.is_dir())
+                && let Err(e) = shell.update(cx, |sh, cx| sh.start_scan(path, cx))
             {
-                if let Some(shell) = shell_handle.take() {
-                    if let Err(e) = shell.update(cx, |sh, cx| sh.start_scan(path, cx)) {
-                        eprintln!("rymd: initial scan kick failed: {e}");
-                    }
-                } else {
-                    eprintln!("rymd: no shell handle captured");
-                }
+                eprintln!("rymd: initial scan kick failed: {e}");
             }
+            // The window is open and rendering by now, so the update check
+            // only ever runs behind a usable Rymd. It makes no network call
+            // on this thread and stays silent when there is no network.
+            let _ = shell.update(cx, |sh, cx| sh.check_for_update(false, cx));
+        } else {
+            eprintln!("rymd: no shell handle captured");
         }
 
         // Keep the process alive until the window closes.
@@ -87,6 +91,3 @@ fn main() {
     });
 }
 
-// Silence unused helper warnings in template code paths.
-#[allow(unused)]
-fn _unused(_: Arc<()>) {}

@@ -23,6 +23,7 @@ actions!(
         TrashSelected,
         DeleteSelected,
         ShowScanIssues,
+        CheckForUpdates,
         ToggleMetric,
         MetricDiskUsage,
         MetricApparent,
