@@ -33,6 +33,7 @@ use crate::scan::options::{ScanOptions, SizeMetric};
 use crate::scan::progress::ScanProgress;
 use crate::scan::scanner::{CancelHandle, ScanLive, ScanOutcome};
 use crate::state::{AppTab, AppState, ScanState};
+use crate::update::{SessionDismissals, UpdateState};
 use crate::ui::duplicate_table::DuplicatesDelegate;
 use crate::ui::file_table::FileTableDelegate;
 use crate::util::format_size::{format_count, format_size};
@@ -53,6 +54,11 @@ pub struct AppShell {
     pub ui_scale: f32,
     /// Monotonic counter invalidating cached derived views (treemap layout).
     pub view_version: u64,
+
+    /// Where the self-updater is. Driven from `ui::update_ui`.
+    pub update: UpdateState,
+    /// Versions the user answered "Later" to during this run.
+    pub update_dismissed: SessionDismissals,
 }
 
 pub struct ActiveScan {
@@ -125,6 +131,8 @@ impl AppShell {
             window_handle: window.window_handle(),
             ui_scale: 1.0,
             view_version: 1,
+            update: UpdateState::Idle,
+            update_dismissed: SessionDismissals::default(),
         }
     }
 
@@ -783,7 +791,7 @@ impl AppShell {
         };
         let body = format!(
             "This will permanently delete:\n{} items\n{}\n\nThe {} directory itself will remain.",
-            format_count(items.max(0)),
+            format_count(items),
             format_size(size),
             name
         );
@@ -1071,6 +1079,10 @@ impl AppShell {
         self.show_issues_sheet(window, cx);
     }
 
+    fn on_check_updates(&mut self, _: &CheckForUpdates, _: &mut Window, cx: &mut Context<Self>) {
+        self.check_for_update(true, cx);
+    }
+
     // Payload actions from context menus.
 
     fn on_open_node(&mut self, a: &OpenNode, _: &mut Window, cx: &mut Context<Self>) {
@@ -1159,6 +1171,7 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_toggle_metric))
             .on_action(cx.listener(Self::on_show_issues))
+            .on_action(cx.listener(Self::on_check_updates))
             .on_action(cx.listener(Self::on_open_node))
             .on_action(cx.listener(Self::on_reveal_node))
             .on_action(cx.listener(Self::on_copy_path_node))
@@ -1177,6 +1190,7 @@ impl Render for AppShell {
             .child(self.render_tab_bar(cx))
             .child(self.render_body(cx))
             .child(self.render_status_bar(cx))
+            .children(self.render_update_progress(cx))
             // Modal, sheet and toast layers owned by gpui-component.
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

@@ -755,7 +755,7 @@ impl AppShell {
 }
 
 fn overflow_menu(mut menu: PopupMenu, metric: SizeMetric) -> PopupMenu {
-    use crate::actions::{MetricApparent, MetricDiskUsage, ScanPath};
+    use crate::actions::{CheckForUpdates, MetricApparent, MetricDiskUsage, ScanPath};
 
     menu = menu.label("Size metric");
     menu = menu.menu_with_check(
@@ -768,6 +768,10 @@ fn overflow_menu(mut menu: PopupMenu, metric: SizeMetric) -> PopupMenu {
         metric == SizeMetric::Apparent,
         Box::new(MetricApparent),
     );
+
+    menu = menu.separator();
+    menu = menu.label(format!("Rymd {}", crate::update::CURRENT));
+    menu = menu.menu("Check for updates...", Box::new(CheckForUpdates));
 
     menu = menu.separator();
     menu = menu.label("Quick scan");
