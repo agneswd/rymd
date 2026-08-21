@@ -20,7 +20,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwayland-dev libxkbcommon-dev libvulkan-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-cursor-dev libvulkan-dev libudev-dev \
             cmake clang build-essential curl file
 
       - name: Build release binary
