@@ -98,7 +98,7 @@ impl Styled for TreemapElement {
 
 /// Inputs that force a relayout when they change.
 #[derive(Clone, Copy, PartialEq)]
-struct LayoutKey {
+pub struct LayoutKey {
     width: f32,
     height: f32,
     version: u64,
@@ -107,7 +107,7 @@ struct LayoutKey {
 /// Per-rectangle display data, cached alongside the geometry so ordinary
 /// frames never touch the model.
 #[derive(Clone)]
-struct RectVisual {
+pub struct RectVisual {
     name: SharedString,
     sublabel: Option<SharedString>,
     level: usize,
@@ -115,7 +115,7 @@ struct RectVisual {
 }
 
 #[derive(Default, Clone)]
-struct TreemapState {
+pub struct TreemapState {
     key: Option<LayoutKey>,
     rects: Vec<TreemapRect>,
     visuals: Vec<RectVisual>,
@@ -127,7 +127,7 @@ pub struct PreparedChildren {}
 
 impl Element for TreemapElement {
     type RequestLayoutState = PreparedChildren;
-    type PrepaintState = ();
+    type PrepaintState = Option<TreemapState>;
 
     fn id(&self) -> Option<ElementId> {
         Some("treemap".into())
@@ -173,7 +173,7 @@ impl Element for TreemapElement {
                 cx,
                 |_style, _origin, _hitbox, _window, _cx| {},
             );
-            return;
+            return None;
         };
         let width = f32::from(bounds.size.width.max(px(0.0)));
         let height = f32::from(bounds.size.height.max(px(0.0)));
@@ -181,7 +181,7 @@ impl Element for TreemapElement {
         // Build or load the cached geometry + visuals. The only model read
         // in steady-state frames happens inside this closure when the key
         // actually changed.
-        let mut state: TreemapState =
+        let state: TreemapState =
             window.with_element_state(global_id, |stored: Option<TreemapState>, _| {
                 let mut state: TreemapState = stored.unwrap_or_default();
                 let key = LayoutKey {
@@ -255,7 +255,6 @@ impl Element for TreemapElement {
                     state.labels.clear();
                     state.key = Some(key);
                 }
-                // Hand back for painting AND persist in one move.
                 let handed_out = state.clone();
                 (handed_out, state)
             });
@@ -304,6 +303,42 @@ impl Element for TreemapElement {
             });
         });
 
+        self.base.interactivity().prepaint(
+            Some(global_id),
+            inspector_id,
+            bounds,
+            bounds.size,
+            window,
+            cx,
+            |_style, _origin, _hitbox, _window, _cx| {},
+        );
+
+        Some(state)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(mut state) = prepaint.take() else {
+            self.base.interactivity().paint(
+                global_id,
+                inspector_id,
+                bounds,
+                None,
+                window,
+                cx,
+                |_, _, _| {},
+            );
+            return;
+        };
+
         // Paint inside the container's content mask.
         let theme = cx.theme();
         let primary = theme.primary;
@@ -320,14 +355,14 @@ impl Element for TreemapElement {
             style: gpui::FontStyle::Normal,
         };
 
-        self.base.interactivity().prepaint(
-            Some(global_id),
+        self.base.interactivity().paint(
+            global_id,
             inspector_id,
             bounds,
-            bounds.size,
+            None,
             window,
             cx,
-            |_style, _origin, _hitbox, window, cx| {
+            |_style, window, cx| {
                 window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                     let opacity = [0.16f32, 0.22, 0.29, 0.36, 0.44];
                     for (ix, r) in state.rects.iter().enumerate() {
@@ -494,28 +529,9 @@ impl Element for TreemapElement {
         );
 
         // Persist any label/hover mutations made above.
-        window.with_element_state(global_id, |_: Option<TreemapState>, _| ((), state));
-    }
-
-    fn paint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.base.interactivity().paint(
-            global_id,
-            inspector_id,
-            bounds,
-            None,
-            window,
-            cx,
-            |_, _, _| {},
-        );
+        if let Some(global_id) = global_id {
+            window.with_element_state(global_id, |_: Option<TreemapState>, _| ((), state));
+        }
     }
 }
 
