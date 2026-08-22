@@ -10,13 +10,13 @@
 //! the updater.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use rymd::model::ScanModel;
 use rymd::scan::options::{Concurrency, ScanOptions};
-use rymd::scan::scanner::{spawn_scan, ScanOutcome};
+use rymd::scan::scanner::{ScanOutcome, spawn_scan};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -71,7 +71,7 @@ struct Sample {
     peak_rss_kb: u64,
 }
 
-fn run_scan(root: &PathBuf) -> Sample {
+fn run_scan(root: &std::path::Path) -> Sample {
     let peak = PeakRss::start();
     let started = Instant::now();
     // Optional worker override for scheduler tuning: RYMD_BENCH_WORKERS=4
@@ -79,23 +79,22 @@ fn run_scan(root: &PathBuf) -> Sample {
     if let Ok(n) = std::env::var("RYMD_BENCH_WORKERS") {
         options.concurrency = Concurrency::Fixed(n.parse().unwrap_or(0));
     }
-    let job = spawn_scan(root.clone(), options);
-    let outcome = job
-        .rx
-        .recv()
-        .unwrap_or_else(|_| panic!("scan thread died"));
+    let job = spawn_scan(root.to_path_buf(), options);
+    let outcome = job.rx.recv().unwrap_or_else(|_| panic!("scan thread died"));
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
     let peak_rss_kb = peak.finish();
 
     match outcome {
-        ScanOutcome::Completed { model, cancelled } => finish(model, wall_ms, cancelled, peak_rss_kb),
+        ScanOutcome::Completed { model, cancelled } => {
+            finish(*model, wall_ms, cancelled, peak_rss_kb)
+        }
         ScanOutcome::Failed { path, error } => {
             panic!("scan of {} failed: {error}", path.display())
         }
     }
 }
 
-fn finish(model: Box<ScanModel>, wall_ms: f64, cancelled: bool, peak_rss_kb: u64) -> Sample {
+fn finish(model: ScanModel, wall_ms: f64, cancelled: bool, peak_rss_kb: u64) -> Sample {
     let root = model.root();
     Sample {
         wall_ms,
@@ -194,7 +193,11 @@ impl PeakRss {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });
-        Self { stop, handle: Some(handle), peak }
+        Self {
+            stop,
+            handle: Some(handle),
+            peak,
+        }
     }
 
     fn finish(mut self) -> u64 {

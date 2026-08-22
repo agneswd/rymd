@@ -128,7 +128,9 @@ pub fn checksum_for(checksums: &str, asset_name: &str) -> Option<String> {
     checksums.lines().find_map(|line| {
         let (digest, name) = line.split_once(char::is_whitespace)?;
         let name = name.trim_start_matches(['*', ' ']).trim();
-        if name != asset_name || digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit())
+        if name != asset_name
+            || digest.len() != 64
+            || !digest.chars().all(|c| c.is_ascii_hexdigit())
         {
             return None;
         }
@@ -216,7 +218,11 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body
 /// Fetch the release listing and its checksum file.
 ///
 /// Blocking. Callers run this off the UI thread.
-pub fn fetch_update(current: &Version, kind: InstallKind, arch: &str) -> Result<Option<UpdateInfo>> {
+pub fn fetch_update(
+    current: &Version,
+    kind: InstallKind,
+    arch: &str,
+) -> Result<Option<UpdateInfo>> {
     let agent = agent(REQUEST_TIMEOUT);
     let body = get(&agent, API_RELEASES)?
         .body_mut()
@@ -298,7 +304,10 @@ pub fn download_verified(
     download: &Arc<Download>,
     on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
-    let asset = info.asset.as_ref().context("no artifact for this platform")?;
+    let asset = info
+        .asset
+        .as_ref()
+        .context("no artifact for this platform")?;
     let expected = info
         .sha256
         .as_ref()
@@ -374,13 +383,17 @@ fn stream_hashed(
             break;
         }
         hasher.update(&buf[..n]);
-        out.write_all(&buf[..n]).context("cannot write the update")?;
+        out.write_all(&buf[..n])
+            .context("cannot write the update")?;
         seen += n as u64;
         on_progress(seen, total);
     }
     out.flush()?;
     if total.is_some_and(|t| t != seen) {
-        bail!("download was incomplete: got {seen} of {} bytes", total.unwrap());
+        bail!(
+            "download was incomplete: got {seen} of {} bytes",
+            total.unwrap()
+        );
     }
     Ok(hex(&hasher.finalize()))
 }
@@ -521,14 +534,14 @@ garbage line
     fn describe_attaches_the_matching_checksum() {
         let rs = releases();
         let (r, v) = select_release(&rs, &Version::new(0, 1, 0), Channel::Stable).unwrap();
-        let sums = format!(
-            "{}  rymd-v0.10.0-linux-x86_64.AppImage\n",
-            "c".repeat(64)
-        );
+        let sums = format!("{}  rymd-v0.10.0-linux-x86_64.AppImage\n", "c".repeat(64));
         let info = describe(r, v, InstallKind::LinuxAppImage, "x86_64", Some(&sums));
         assert_eq!(info.sha256.as_deref(), Some("c".repeat(64).as_str()));
         assert!(info.is_installable());
-        assert_eq!(info.page_url, "https://github.com/agneswd/rymd/releases/tag/v0.10.0");
+        assert_eq!(
+            info.page_url,
+            "https://github.com/agneswd/rymd/releases/tag/v0.10.0"
+        );
     }
 
     fn stream(data: &[u8], total: Option<u64>) -> Result<String> {
@@ -617,4 +630,3 @@ garbage line
         assert!(check_download_url("https://github.com@evil.example/x").is_err());
     }
 }
-

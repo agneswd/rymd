@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
-use gpui::{px, size, AppContext as _, Application, Bounds, KeyBinding, WindowBounds, WindowOptions};
+use gpui::{
+    AppContext as _, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size,
+};
 use gpui_component::Root;
-use rymd::assets::Assets;
 use rymd::actions::*;
-use rymd::update;
+use rymd::assets::Assets;
 use rymd::ui::shell::AppShell;
+use rymd::update;
 
 use gpui::actions;
 
@@ -78,4 +80,3 @@ fn main() {
         cx.activate(true);
     });
 }
-

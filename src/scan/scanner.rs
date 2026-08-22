@@ -24,12 +24,12 @@ use crossbeam_deque::{Stealer, Worker};
 use parking_lot::Mutex;
 
 use crate::model::{
-    Node, NodeId, NodeKind, ScanIssue, ScanModel, HARDLINK_SHARED, MOUNT_BOUNDARY, UNREADABLE,
+    HARDLINK_SHARED, MOUNT_BOUNDARY, Node, NodeId, NodeKind, ScanIssue, ScanModel, UNREADABLE,
 };
-use crate::scan::metadata::{backend, EntryKind, FileMetadata, ScannerBackend};
+use crate::scan::metadata::{EntryKind, FileMetadata, ScannerBackend, backend};
 use crate::scan::options::{Concurrency, ScanOptions};
 use crate::scan::progress::ScanProgress;
-use crate::scan::scheduler::{DirJob, EntryBatch, Job, Scheduler, CHUNK};
+use crate::scan::scheduler::{CHUNK, DirJob, EntryBatch, Job, Scheduler};
 
 /// Human-readable name of the scanning backend, for diagnostics.
 pub const BACKEND_NAME: &str = "work-stealing";
@@ -130,11 +130,11 @@ impl WorkerState {
 
     /// Throttled: visual progress needs roughly a dozen updates a second,
     /// not one mutex write per directory.
-    fn report_current(&mut self, shared: &Shared, dir: &PathBuf) {
+    fn report_current(&mut self, shared: &Shared, dir: &std::path::Path) {
         let now = Instant::now();
         if now.duration_since(self.last_current_push) >= Duration::from_millis(80) {
             self.last_current_push = now;
-            *shared.current.lock() = dir.clone();
+            *shared.current.lock() = dir.to_path_buf();
         }
     }
 }
@@ -351,15 +351,12 @@ fn worker_loop(shared: &Arc<Shared>, local: Worker<Job>, stealers: &[Stealer<Job
         if shared.is_cancelled() {
             break;
         }
-        match shared.sched.find(&local, stealers) {
-            Some(job) => {
-                process_job(shared, fs, job, &mut st, &options);
-                if shared.sched.complete() {
-                    break; // nothing outstanding anywhere
-                }
-                continue;
+        if let Some(job) = shared.sched.find(&local, stealers) {
+            process_job(shared, fs, job, &mut st, &options);
+            if shared.sched.complete() {
+                break; // nothing outstanding anywhere
             }
-            None => {}
+            continue;
         }
         // No work right now. Register as idle first (so a concurrent push
         // wakes us), then re-check once before actually parking.
@@ -447,19 +444,29 @@ fn process_dir(
         let mut start = inline_limit;
         while start < total {
             let end = (start + CHUNK).min(total);
-            shared.sched.push(Job::Meta(crate::scan::scheduler::MetaJob {
-                dir: task.path.clone(),
-                parent: task.parent,
-                dev: task.dev,
-                names: batch.names.slice_range(start, end),
-            }));
+            shared
+                .sched
+                .push(Job::Meta(crate::scan::scheduler::MetaJob {
+                    dir: task.path.clone(),
+                    parent: task.parent,
+                    dev: task.dev,
+                    names: batch.names.slice_range(start, end),
+                }));
             start = end;
         }
         batch.names = batch.names.slice_range(0, inline_limit);
         batch.meta.truncate(inline_limit);
     }
 
-    insert_batch(shared, batch, &task.path, task.parent, task.dev, st, options);
+    insert_batch(
+        shared,
+        batch,
+        &task.path,
+        task.parent,
+        task.dev,
+        st,
+        options,
+    );
 }
 
 /// Insert one chunk's nodes under `parent`, then queue its child
@@ -549,7 +556,9 @@ fn insert_batch(
             // Only directories need a full path: traversal continues from
             // them. Plain files never get one during the scan.
             to_queue.push(ToQueue {
-                path: dir.as_path().join::<&std::ffi::OsStr>(&batch.names.name_os(ix)),
+                path: dir
+                    .as_path()
+                    .join::<&std::ffi::OsStr>(&batch.names.name_os(ix)),
                 id,
                 dev: md.device,
             });
@@ -643,7 +652,12 @@ mod tests {
         assert_eq!(m.node(r).children.len(), 3);
         assert_eq!(m.node(r).file_count, 2);
         assert_eq!(m.node(r).dir_count, 2);
-        let logical: u64 = m.node(r).children.iter().map(|&c| m.node(c).agg_logical).sum();
+        let logical: u64 = m
+            .node(r)
+            .children
+            .iter()
+            .map(|&c| m.node(c).agg_logical)
+            .sum();
         assert!(logical >= 60_000, "logical {logical}");
         let allocated: u64 = m
             .node(r)
@@ -651,7 +665,10 @@ mod tests {
             .iter()
             .map(|&c| m.node(c).agg_allocated)
             .sum();
-        assert!(allocated >= logical, "allocated {allocated} < logical {logical}");
+        assert!(
+            allocated >= logical,
+            "allocated {allocated} < logical {logical}"
+        );
     }
 
     #[test]
@@ -769,7 +786,8 @@ mod tests {
         assert_eq!(carriers, 1, "payload must be carried by exactly one link");
         // solo files: none here besides the links themselves.
         assert_eq!(
-            total_own, big.len() as u64,
+            total_own,
+            big.len() as u64,
             "multi-link storage must be counted exactly once"
         );
     }
@@ -837,7 +855,9 @@ mod tests {
         let job = spawn_scan(root.to_path_buf(), ScanOptions::default());
         job.cancel.cancel();
         match job.rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(ScanOutcome::Completed { cancelled: true, .. }) => {}
+            Ok(ScanOutcome::Completed {
+                cancelled: true, ..
+            }) => {}
             other => panic!("expected cancelled completion, got {other:?}"),
         }
     }

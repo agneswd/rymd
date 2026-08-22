@@ -10,11 +10,11 @@
 //! Identity (`st_dev`/`st_ino`), allocated blocks, and `statvfs` free
 //! space round out the platform layer.
 
+use std::ffi::OsString;
 use std::io;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::MetadataExt;
-use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use super::super::metadata::{EntryKind, FileMetadata, ScannerBackend};
@@ -40,13 +40,11 @@ impl LinuxFilesystem {
                 continue;
             }
             buf[..bytes.len()].copy_from_slice(bytes);
-            let cname = unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(
-                &buf[..=bytes.len()],
-            ) };
+            let cname =
+                unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(&buf[..=bytes.len()]) };
             let mut st: libc::stat64 = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::fstatat64(fd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-            };
+            let rc =
+                unsafe { libc::fstatat64(fd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
             out.push(if rc == 0 {
                 Some(md_from_stat(&st))
             } else {
@@ -68,17 +66,18 @@ fn md_from_stat(st: &libc::stat64) -> FileMetadata {
         kind,
         logical: st.st_size as u64,
         allocated: (st.st_blocks as u64) * 512,
-        modified_ms: Some(unix_ms(st.st_mtime as i64, st.st_mtime_nsec)),
-        device: st.st_dev as u64,
-        inode: st.st_ino as u64,
-        nlink: st.st_nlink as u64,
+        modified_ms: Some(unix_ms(st.st_mtime, st.st_mtime_nsec)),
+        device: st.st_dev,
+        inode: st.st_ino,
+        nlink: st.st_nlink,
     }
 }
 
 /// Milliseconds since the epoch; saturates rather than panicking on
 /// pre-epoch timestamps far from anything a disk actually holds.
 fn unix_ms(secs: i64, nsecs: i64) -> i64 {
-    (secs as i128 * 1000 + nsecs as i128 / 1_000_000).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    (secs as i128 * 1000 + nsecs as i128 / 1_000_000).clamp(i64::MIN as i128, i64::MAX as i128)
+        as i64
 }
 
 impl ScannerBackend for LinuxFilesystem {

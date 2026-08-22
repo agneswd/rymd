@@ -18,7 +18,8 @@ use gpui_component::dialog::DialogButtonProps;
 use gpui_component::notification::NotificationType;
 use gpui_component::progress::Progress;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
+    v_flex,
 };
 
 use crate::ui::shell::AppShell;
@@ -76,13 +77,17 @@ impl AppShell {
                         if manual {
                             shell.notify_update(
                                 NotificationType::Success,
-                                format!("You're using the latest version of Rymd ({}).", update::CURRENT),
+                                format!(
+                                    "You're using the latest version of Rymd ({}).",
+                                    update::CURRENT
+                                ),
                                 cx,
                             );
                         }
                     }
                     UpdateStatus::UpdateAvailable(info) => {
-                        let offer = manual || shell.update_dismissed.should_auto_offer(&info.version);
+                        let offer =
+                            manual || shell.update_dismissed.should_auto_offer(&info.version);
                         shell.update = UpdateState::Available(info.clone());
                         if offer {
                             shell.offer_update(info, cx);
@@ -115,7 +120,11 @@ impl AppShell {
             info.is_installable() && update::installer::for_current_install(kind).can_self_update();
         let title = format!("{} is available", info.name);
         let mut body = format!("You are currently using {}.", update::CURRENT);
-        if let Some(day) = info.published_at.as_deref().and_then(|p| p.split('T').next()) {
+        if let Some(day) = info
+            .published_at
+            .as_deref()
+            .and_then(|p| p.split('T').next())
+        {
             body.push_str(&format!(" Released {day}."));
         }
         let note = (!installable).then(|| kind.manual_reason().to_string());
@@ -172,7 +181,8 @@ impl AppShell {
                         let page = page.clone();
                         move |_, _, cx| {
                             if installable {
-                                let _ = weak.update(cx, |shell, cx| shell.start_update_download(cx));
+                                let _ =
+                                    weak.update(cx, |shell, cx| shell.start_update_download(cx));
                             } else {
                                 cx.open_url(&page);
                             }
@@ -221,7 +231,9 @@ impl AppShell {
             while let Ok((seen, total)) = rx.recv().await {
                 this.update(cx, |shell, cx| {
                     if let UpdateState::Downloading {
-                        downloaded, total: t, ..
+                        downloaded,
+                        total: t,
+                        ..
                     } = &mut shell.update
                     {
                         *downloaded = seen;
@@ -343,23 +355,25 @@ impl AppShell {
     pub fn render_update_progress(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme();
         if let UpdateState::Failed(reason) = &self.update {
-            return Some(self.update_card(
-                theme,
-                "Update failed",
-                Button::new("update-dismiss")
-                    .ghost()
-                    .xsmall()
-                    .label("Dismiss")
-                    .on_click(cx.listener(|shell, _, _, cx| {
-                        shell.update = UpdateState::Idle;
-                        cx.notify();
-                    })),
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(reason.clone())
-                    .into_any_element(),
-            ));
+            return Some(
+                self.update_card(
+                    theme,
+                    "Update failed",
+                    Button::new("update-dismiss")
+                        .ghost()
+                        .xsmall()
+                        .label("Dismiss")
+                        .on_click(cx.listener(|shell, _, _, cx| {
+                            shell.update = UpdateState::Idle;
+                            cx.notify();
+                        })),
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(reason.clone())
+                        .into_any_element(),
+                ),
+            );
         }
 
         let UpdateState::Downloading {
@@ -389,9 +403,7 @@ impl AppShell {
                     .xsmall()
                     .label(if cancelling { "Cancelling" } else { "Cancel" })
                     .disabled(cancelling)
-                    .on_click(
-                        cx.listener(|shell, _, _, cx| shell.cancel_update_download(cx)),
-                    ),
+                    .on_click(cx.listener(|shell, _, _, cx| shell.cancel_update_download(cx))),
                 v_flex()
                     .gap_2()
                     .child(Progress::new().value(progress.unwrap_or(0.)))

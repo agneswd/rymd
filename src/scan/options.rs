@@ -1,17 +1,12 @@
 /// Options controlling a scan.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Concurrency {
     /// One worker per available parallelism unit (respects cgroup CPU
     /// quotas on Linux). No arbitrary ceiling.
+    #[default]
     Auto,
     Fixed(usize),
-}
-
-impl Default for Concurrency {
-    fn default() -> Self {
-        Concurrency::Auto
-    }
 }
 
 /// Which byte count drives the treemap, table and summary.

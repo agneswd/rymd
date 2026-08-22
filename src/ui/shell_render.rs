@@ -2,7 +2,7 @@
 //! state logic stays readable.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{div, px, Context, IntoElement, ParentElement as _, SharedString, Styled as _};
+use gpui::{Context, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu};
@@ -11,7 +11,7 @@ use gpui_component::spinner::Spinner;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::Table;
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar, h_flex, v_flex,
 };
 
 use crate::model::NodeId;
@@ -35,9 +35,7 @@ impl AppShell {
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(
-                    gpui::img("rymd.svg").size(px(16.)),
-                )
+                .child(gpui::img("rymd.svg").size(px(16.)))
                 .child(
                     div()
                         .text_sm()
@@ -534,15 +532,13 @@ impl AppShell {
                     .items_center()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
-                        div().text_sm().font_weight(gpui::FontWeight::MEDIUM).child(
-                            SharedString::from(format!(
-                                "{} selected · {}",
-                                format_count(sel_count as u64),
-                                crate::util::format_size::format_size(sel_bytes)
-                            )),
-                        ),
-                    )
+                    .child(div().text_sm().font_weight(gpui::FontWeight::MEDIUM).child(
+                        SharedString::from(format!(
+                            "{} selected · {}",
+                            format_count(sel_count as u64),
+                            crate::util::format_size::format_size(sel_bytes)
+                        )),
+                    ))
                     .flex_1(),
             );
         }
@@ -565,15 +561,13 @@ impl AppShell {
 
         let total_groups = ds.groups.len();
         let reclaimable: u64 = ds.groups.iter().map(|g| g.reclaimable).sum();
-        footer = footer.child(
-            div().text_xs().text_color(theme.muted_foreground).child(
-                SharedString::from(format!(
-                    "{} groups · {} reclaimable",
-                    format_count(total_groups as u64),
-                    crate::util::format_size::format_size(reclaimable)
-                )),
-            ),
-        );
+        footer = footer.child(div().text_xs().text_color(theme.muted_foreground).child(
+            SharedString::from(format!(
+                "{} groups · {} reclaimable",
+                format_count(total_groups as u64),
+                crate::util::format_size::format_size(reclaimable)
+            )),
+        ));
 
         if sel_count > 0 {
             footer = footer

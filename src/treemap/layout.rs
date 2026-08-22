@@ -50,11 +50,7 @@ fn row_worst_ratio(areas: &[f64], side: f64, row_area: f64) -> f64 {
         .map(|&a| {
             let len = a / depth.max(f64::MIN_POSITIVE);
             let r = len / depth;
-            if r < 1.0 {
-                1.0 / r
-            } else {
-                r
-            }
+            if r < 1.0 { 1.0 / r } else { r }
         })
         .fold(f64::MIN_POSITIVE, f64::max)
 }

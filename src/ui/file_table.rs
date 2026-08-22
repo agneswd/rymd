@@ -2,14 +2,16 @@
 
 use std::rc::Rc;
 
-use gpui::{div, px, App, Context, IntoElement, ParentElement as _, Styled as _, WeakEntity, Window};
+use gpui::{
+    App, Context, IntoElement, ParentElement as _, Styled as _, WeakEntity, Window, div, px,
+};
 use gpui_component::menu::PopupMenu;
 use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
-use gpui_component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
 
 use parking_lot::RwLock;
 
-use crate::model::{NodeId, NodeKind, ScanModel, HARDLINK_SHARED, MOUNT_BOUNDARY};
+use crate::model::{HARDLINK_SHARED, MOUNT_BOUNDARY, NodeId, NodeKind, ScanModel};
 use crate::scan::options::SizeMetric;
 use crate::ui::menus;
 use crate::ui::shell::AppShell;
@@ -125,17 +127,9 @@ impl FileTableDelegate {
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_col == COL_NAME {
-                if asc {
-                    ord
-                } else {
-                    ord.reverse()
-                }
+                if asc { ord } else { ord.reverse() }
             } else {
-                if asc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
+                if asc { ord.reverse() } else { ord }
             }
         });
         let _ = dir_id;
@@ -298,7 +292,9 @@ impl TableDelegate for FileTableDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(&node) = self.rows.get(row_ix) else { return menu };
+        let Some(&node) = self.rows.get(row_ix) else {
+            return menu;
+        };
         let (is_dir, hardlink) = {
             let Some(model) = &self.model else {
                 return menu;

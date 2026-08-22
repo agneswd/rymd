@@ -11,10 +11,10 @@
 //! [`CHUNK`] spill their remaining metadata work as stealable `Meta`
 //! chunks.
 
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::Mutex;
 use std::thread;
 
 use crossbeam_deque::{Injector, Stealer, Worker};
@@ -26,15 +26,23 @@ use crate::model::NodeId;
 /// enough that a huge listing keeps every worker busy.
 pub const CHUNK: usize = 64;
 
-/// Raw entry names from one directory, concatenated into a single
-/// allocation. `ends` holds cumulative end offsets.
+/// Raw entry names from one directory, stored contiguously.
+///
+/// Unix stores each name as raw bytes (`OsStr`'s native form). Windows
+/// stores UTF-16 code units, which is what directory records carry, so
+/// bulk enumeration never converts through an `OsString`. `ends` holds
+/// cumulative end positions in elements.
 #[derive(Default)]
 pub struct NameBlob {
+    #[cfg(unix)]
     data: Box<[u8]>,
+    #[cfg(windows)]
+    data: Box<[u16]>,
     ends: Vec<u32>,
 }
 
 impl NameBlob {
+    /// Build from an iterator of OS string slices.
     pub fn from_names<'a, I>(names: I) -> Self
     where
         I: IntoIterator<Item = &'a std::ffi::OsStr>,
@@ -47,28 +55,12 @@ impl NameBlob {
                 use std::os::unix::ffi::OsStrExt as _;
                 data.extend_from_slice(name.as_bytes());
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                data.extend_from_slice(name.to_string_lossy().as_bytes());
+                use std::os::windows::ffi::OsStrExt as _;
+                data.extend(name.encode_wide());
             }
-            ends.push(data.len() as u32);
-        }
-        Self {
-            data: data.into_boxed_slice(),
-            ends,
-        }
-    }
-
-    /// Build from per-name raw byte vectors, consuming them without an
-    /// extra copy per name.
-    #[cfg(unix)]
-    pub fn from_flattened(parts: Vec<Vec<u8>>) -> Self {
-        let total: usize = parts.iter().map(|p| p.len()).sum();
-        let mut data = Vec::with_capacity(total);
-        let mut ends = Vec::with_capacity(parts.len());
-        for part in parts {
-            data.extend_from_slice(&part);
-            ends.push(data.len() as u32);
+            ends.push(element_len(&data) as u32);
         }
         Self {
             data: data.into_boxed_slice(),
@@ -84,11 +76,26 @@ impl NameBlob {
         self.ends.is_empty()
     }
 
-    /// Raw bytes of the name at `ix`. POSIX names cannot contain interior
-    /// NUL bytes, so these round-trip through syscalls losslessly.
+    /// Raw bytes of the name at `ix` (Unix). POSIX names cannot contain
+    /// interior NUL bytes, so these round-trip through syscalls losslessly.
     #[cfg(unix)]
     pub fn bytes(&self, ix: usize) -> &[u8] {
-        let start = if ix == 0 { 0 } else { self.ends[ix - 1] as usize };
+        let start = if ix == 0 {
+            0
+        } else {
+            self.ends[ix - 1] as usize
+        };
+        &self.data[start..self.ends[ix] as usize]
+    }
+
+    /// Raw UTF-16 code units of the name at `ix` (Windows).
+    #[cfg(windows)]
+    pub fn units(&self, ix: usize) -> &[u16] {
+        let start = if ix == 0 {
+            0
+        } else {
+            self.ends[ix - 1] as usize
+        };
         &self.data[start..self.ends[ix] as usize]
     }
 
@@ -98,9 +105,10 @@ impl NameBlob {
         std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(self.bytes(ix)))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn name_os(&self, ix: usize) -> std::borrow::Cow<'_, std::ffi::OsStr> {
-        String::from_utf8_lossy(self.bytes(ix)).into_owned().into()
+        use std::os::windows::ffi::OsStringExt as _;
+        std::borrow::Cow::Owned(std::ffi::OsString::from_wide(self.units(ix)))
     }
 
     fn starts(&self, ix: usize) -> usize {
@@ -116,7 +124,7 @@ impl NameBlob {
     }
 
     /// Extract the sub-blob for a half-open name range, copying that
-    /// slice's bytes.
+    /// slice's elements.
     pub fn slice_range(&self, start_ix: usize, end_ix: usize) -> NameBlob {
         let (s, e) = (self.starts(start_ix), self.end(end_ix - 1));
         let data = self.data[s..e].to_vec();
@@ -129,6 +137,46 @@ impl NameBlob {
             ends,
         }
     }
+
+    #[cfg(unix)]
+    pub(crate) fn from_flattened(parts: Vec<Vec<u8>>) -> Self {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut data = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(parts.len());
+        for part in parts {
+            data.extend_from_slice(&part);
+            ends.push(data.len() as u32);
+        }
+        Self {
+            data: data.into_boxed_slice(),
+            ends,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_wide_parts(parts: Vec<Vec<u16>>) -> Self {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut data = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(parts.len());
+        for part in parts {
+            data.extend_from_slice(&part);
+            ends.push(data.len() as u32);
+        }
+        Self {
+            data: data.into_boxed_slice(),
+            ends,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn element_len(data: &[u16]) -> usize {
+    data.len()
+}
+
+#[cfg(not(windows))]
+fn element_len(data: &[u8]) -> usize {
+    data.len()
 }
 
 /// One directory's entries: raw names plus whatever metadata the OS handed
@@ -244,24 +292,24 @@ impl Scheduler {
         local
             .pop()
             .or_else(|| match self.injector.steal() {
-                    crossbeam_deque::Steal::Success(job) => Some(job),
-                    _ => None,
-                })
+                crossbeam_deque::Steal::Success(job) => Some(job),
+                _ => None,
+            })
             .or_else(|| {
-            let n = stealers.len();
-            if n == 0 {
-                return None;
-            }
-            let start = self.rotor.fetch_add(1, Ordering::Relaxed) % n;
-            for k in 0..n {
-                match stealers[(start + k) % n].steal() {
-                    crossbeam_deque::Steal::Success(job) => return Some(job),
-                    crossbeam_deque::Steal::Empty => continue,
-                    crossbeam_deque::Steal::Retry => return None,
+                let n = stealers.len();
+                if n == 0 {
+                    return None;
                 }
-            }
-            None
-        })
+                let start = self.rotor.fetch_add(1, Ordering::Relaxed) % n;
+                for k in 0..n {
+                    match stealers[(start + k) % n].steal() {
+                        crossbeam_deque::Steal::Success(job) => return Some(job),
+                        crossbeam_deque::Steal::Empty => continue,
+                        crossbeam_deque::Steal::Retry => return None,
+                    }
+                }
+                None
+            })
     }
 }
 

@@ -89,7 +89,10 @@ mod tests {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(42_101), "41.1 KB");
         assert_eq!(format_size(782 * 1024 * 1024), "782 MB");
-        assert_eq!(format_size(14 * 1024 * 1024 * 1024 + 800_000_000), "14.7 GB");
+        assert_eq!(
+            format_size(14 * 1024 * 1024 * 1024 + 800_000_000),
+            "14.7 GB"
+        );
     }
 
     #[test]

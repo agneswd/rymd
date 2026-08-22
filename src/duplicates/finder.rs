@@ -107,7 +107,9 @@ pub fn detect(
         let mut dup_ids: Vec<NodeId> = Vec::new();
         for id in ids {
             progress.files_scanned.fetch_add(1, Ordering::Relaxed);
-            let Some((path, _)) = sizes.get(&id) else { continue };
+            let Some((path, _)) = sizes.get(&id) else {
+                continue;
+            };
             match crate::duplicates::hashing::partial_hash(path, size) {
                 Ok(h) => match seen.get(&h) {
                     Some(_) => dup_ids.push(id),
@@ -135,7 +137,9 @@ pub fn detect(
         let mut by_hash: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
         for id in ids {
             progress.files_scanned.fetch_add(1, Ordering::Relaxed);
-            let Some((path, _)) = sizes.get(&id) else { continue };
+            let Some((path, _)) = sizes.get(&id) else {
+                continue;
+            };
             match crate::duplicates::hashing::full_hash(path) {
                 Ok(h) => by_hash.entry(h).or_default().push(id),
                 Err(_) => continue,
@@ -149,10 +153,7 @@ pub fn detect(
             // Collapse identical inodes into one identity.
             let mut identities: HashMap<(u64, u64), Vec<NodeId>> = HashMap::new();
             for id in &group_ids {
-                let ident = sizes
-                    .get(id)
-                    .map(|(_, i)| *i)
-                    .unwrap_or((0, 0));
+                let ident = sizes.get(id).map(|(_, i)| *i).unwrap_or((0, 0));
                 identities.entry(ident).or_default().push(*id);
             }
 
@@ -193,7 +194,7 @@ pub fn detect(
 mod tests {
     use super::*;
     use crate::scan::options::ScanOptions;
-    use crate::scan::scanner::{spawn_scan, ScanOutcome};
+    use crate::scan::scanner::{ScanOutcome, spawn_scan};
     use std::fs;
     use std::time::Duration;
 
