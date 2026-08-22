@@ -138,6 +138,8 @@ impl AppShell {
                 dialog
                     .title(title.clone())
                     .confirm()
+                    .close_button(true)
+                    .overlay_closable(true)
                     .button_props(
                         DialogButtonProps::default()
                             .ok_text(if installable {
@@ -291,6 +293,8 @@ impl AppShell {
                 dialog
                     .title("Update ready")
                     .confirm()
+                    .close_button(true)
+                    .overlay_closable(true)
                     .button_props(
                         DialogButtonProps::default()
                             .ok_text("Restart and update")
