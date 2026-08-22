@@ -15,6 +15,7 @@ actions!(
         OpenFolder,
         Rescan,
         FocusFilter,
+        FocusSearch,
         NavBack,
         NavForward,
         NavParent,

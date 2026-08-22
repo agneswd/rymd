@@ -58,6 +58,24 @@ impl ScanModel {
         Self::new(PathBuf::new(), 0)
     }
 
+    /// Assemble a model from prebuilt nodes (synthetic benchmarks and
+    /// tests). Callers keep the parents-before-children invariant.
+    pub fn from_nodes(root_path: PathBuf, root_device: u64, nodes: Vec<Node>) -> Self {
+        let mut m = Self {
+            root_path,
+            root_device,
+            nodes,
+            issues: Vec::new(),
+            free_space: None,
+            duration_ms: 0,
+            aggregate_ms: 0.0,
+            backend: "",
+            was_cancelled: false,
+        };
+        m.aggregate();
+        m
+    }
+
     pub(crate) fn take(&mut self) -> ScanModel {
         std::mem::replace(self, ScanModel::empty())
     }

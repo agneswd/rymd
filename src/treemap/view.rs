@@ -5,14 +5,14 @@
 //! virtual list uses), runs the pure squarify layout from `layout.rs`, and
 //! then lays out and paints one interactive `div` per rectangle.
 
-use std::rc::Rc;
-
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Size, Stateful,
     StatefulInteractiveElement as _, Styled, WeakEntity, Window, div, point, px,
 };
 use gpui_component::{ActiveTheme as _, tooltip::Tooltip};
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 
 use crate::model::{HARDLINK_SHARED, MOUNT_BOUNDARY, NodeId, ScanModel};
@@ -33,7 +33,7 @@ const MAX_RECTS: usize = 1200;
 pub struct TreemapElement {
     base: gpui::Stateful<gpui::Div>,
     items: Vec<TreemapItem>,
-    model: Rc<RwLock<ScanModel>>,
+    model: Arc<RwLock<ScanModel>>,
     dir_total: u64,
     metric: SizeMetric,
     selected: Option<u32>,
@@ -47,7 +47,7 @@ pub struct TreemapElement {
 impl TreemapElement {
     pub fn new(
         items: Vec<TreemapItem>,
-        model: Rc<RwLock<ScanModel>>,
+        model: Arc<RwLock<ScanModel>>,
         dir_total: u64,
         metric: SizeMetric,
         selected: Option<u32>,

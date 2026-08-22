@@ -7,6 +7,7 @@ pub mod assets;
 pub mod duplicates;
 pub mod model;
 pub mod scan;
+pub mod search;
 pub mod state;
 pub mod treemap;
 pub mod ui;

@@ -23,6 +23,7 @@ fn main() {
             KeyBinding::new("ctrl-o", OpenFolder, Some("Rymd")),
             KeyBinding::new("ctrl-r", Rescan, Some("Rymd")),
             KeyBinding::new("ctrl-f", FocusFilter, Some("Rymd")),
+            KeyBinding::new("ctrl-shift-f", FocusSearch, Some("Rymd")),
             KeyBinding::new("alt-left", NavBack, Some("Rymd")),
             KeyBinding::new("alt-right", NavForward, Some("Rymd")),
             KeyBinding::new("backspace", NavParent, Some("Rymd")),

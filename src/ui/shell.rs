@@ -6,7 +6,7 @@
 //! view only renders state and forwards user intent.
 
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use crate::model::{NodeId, ScanModel};
 use crate::scan::options::{ScanOptions, SizeMetric};
 use crate::scan::progress::ScanProgress;
 use crate::scan::scanner::{CancelHandle, ScanLive, ScanOutcome};
+use crate::search::{SearchIndex, normalize_query};
 use crate::state::{AppState, AppTab, ScanState};
 use crate::ui::duplicate_table::DuplicatesDelegate;
 use crate::ui::file_table::FileTableDelegate;
@@ -36,11 +37,20 @@ use crate::util::format_size::{format_count, format_size};
 
 pub struct AppShell {
     pub state: AppState,
-    pub model: Option<Rc<RwLock<ScanModel>>>,
+    pub model: Option<Arc<RwLock<ScanModel>>>,
     pub scan_job: Option<ActiveScan>,
     pub progress: ScanProgress,
 
     pub filter_input: Entity<InputState>,
+    /// Global search over the whole completed scan.
+    pub search_input: Entity<InputState>,
+    pub search_index: Option<Arc<SearchIndex>>,
+    /// Non-empty while a search query is active.
+    pub search_results: Vec<NodeId>,
+    /// The query the current results belong to (normalized).
+    pub search_query_active: String,
+    /// Guards stale background searches from overwriting newer ones.
+    pub search_generation: u64,
     pub table: Entity<TableState<FileTableDelegate>>,
     pub dup_table: Entity<TableState<DuplicatesDelegate>>,
 
@@ -67,6 +77,7 @@ impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter this directory"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search all files"));
         let delegate = FileTableDelegate::new();
         let table = cx.new(|cx| {
             TableState::new(delegate, window, cx)
@@ -124,6 +135,11 @@ impl AppShell {
             scan_job: None,
             progress: ScanProgress::default(),
             filter_input,
+            search_input,
+            search_index: None,
+            search_results: Vec::new(),
+            search_query_active: String::new(),
+            search_generation: 0,
             table,
             dup_table,
             focus_handle,
@@ -204,7 +220,7 @@ impl AppShell {
                     free_bytes: model.free_space,
                 });
                 self.state.scan = ScanState::Complete;
-                let rc = Rc::new(RwLock::new(*model));
+                let rc = Arc::new(RwLock::new(*model));
                 self.model = Some(rc.clone());
                 let shell_weak = cx.entity().downgrade();
                 self.table.update(cx, |t, _| {
@@ -215,6 +231,7 @@ impl AppShell {
                 });
                 // Land the view on the scan root.
                 self.state.current_node = Some(NodeId(0));
+                self.reset_search(cx);
                 if self.state.active_tab == crate::state::AppTab::Duplicates {
                     self.ensure_duplicates(cx);
                 }
@@ -962,6 +979,106 @@ impl AppShell {
             .unwrap_or_default()
     }
 
+    // ---- global search -----------------------------------------------------
+
+    /// Kick off index construction for a finished model. Runs off-thread;
+    /// searching before it lands falls back to nothing.
+    fn build_search_index(&mut self, cx: &mut Context<Self>) {
+        let Some(model) = &self.model else { return };
+        self.search_index = None;
+        self.search_results.clear();
+        self.search_query_active.clear();
+        self.search_generation += 1;
+        let model = model.clone();
+        let task = smol::unblock(move || SearchIndex::build(&model.read()));
+        cx.spawn(async move |this, cx| {
+            let index = task.await;
+            this.update(cx, |shell, _| {
+                shell.search_index = Some(Arc::new(index));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_search(&mut self, cx: &mut Context<Self>) {
+        self.search_results.clear();
+        self.search_query_active.clear();
+        self.search_generation += 1;
+        self.build_search_index(cx);
+        cx.notify();
+    }
+
+    /// Refine in place when the query grew character by character;
+    /// otherwise run a full pass off-thread with generation guarding.
+    pub fn run_search(&mut self, raw: String, cx: &mut Context<Self>) {
+        let query = normalize_query(&raw);
+        if query.is_empty() {
+            self.search_results.clear();
+            self.search_query_active.clear();
+            self.search_generation += 1;
+            cx.notify();
+            return;
+        }
+        let extends_current = !self.search_query_active.is_empty()
+            && query.starts_with(self.search_query_active.as_bytes())
+            && !self.search_results.is_empty();
+
+        if extends_current {
+            let previous = std::mem::take(&mut self.search_results);
+            self.search_generation += 1;
+            if let Some(index) = &self.search_index {
+                self.search_results = index.refine(&previous, &query);
+            }
+            self.search_query_active = String::from_utf8_lossy(&query).into_owned();
+            cx.notify();
+            return;
+        }
+
+        self.search_query_active = String::from_utf8_lossy(&query).into_owned();
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        let Some(index) = self.search_index.clone() else {
+            return;
+        };
+        let task = smol::unblock(move || index.find(&query));
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            this.update(cx, |shell, cx| {
+                // A newer query already replaced us; discard stale work.
+                if shell.search_generation == generation {
+                    shell.search_results = results;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Jump to a search hit: open its parent directory and select it.
+    pub fn open_search_result(
+        &mut self,
+        node: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = self.model.as_ref().and_then(|m| m.read().node(node).parent);
+        if let Some(parent) = parent {
+            self.navigate_to(parent, cx);
+        }
+        self.select_node(node, cx);
+        window.focus(&self.focus_handle);
+    }
+
+    /// The path of a search result, resolved only when a row is shown.
+    pub(crate) fn search_result_path(&self, node: NodeId) -> String {
+        self.model
+            .as_ref()
+            .map(|m| m.read().path_of(node).to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     // ---- misc --------------------------------------------------------------
 
     pub fn set_metric(&mut self, metric: SizeMetric, cx: &mut Context<Self>) {
@@ -1059,6 +1176,11 @@ impl AppShell {
 
     fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_filter(window, cx);
+    }
+
+    fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |input, cx| input.focus(window, cx));
     }
 
     fn on_nav_back(&mut self, _: &NavBack, _: &mut Window, cx: &mut Context<Self>) {
@@ -1210,6 +1332,7 @@ impl Render for AppShell {
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_rescan))
             .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_nav_back))
             .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_nav_parent))
