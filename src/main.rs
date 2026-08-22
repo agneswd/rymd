@@ -40,6 +40,11 @@ fn main() {
 
         cx.on_action(|_: &Quit, cx| cx.quit());
 
+        cx.on_window_closed(|cx| {
+            cx.quit();
+        })
+        .detach();
+
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
         let initial_path = std::env::args().nth(1).map(PathBuf::from);
         let mut shell_handle = None;
