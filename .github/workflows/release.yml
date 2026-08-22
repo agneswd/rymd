@@ -76,6 +76,7 @@ jobs:
           mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/512x512/apps \
                    AppDir/usr/share/applications
           cp target/release/rymd AppDir/usr/bin/
+          ln -s usr/bin/rymd AppDir/AppRun
           cp assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/rymd.png
           cp assets/icon.png AppDir/rymd.png
           cp assets/rymd.svg AppDir/rymd.svg
