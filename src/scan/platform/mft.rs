@@ -845,6 +845,10 @@ pub struct MftExtent {
 ///   - 0x00..0x08: `NextVcn` (`i64` / `u64`)
 ///   - 0x08..0x10: `Lcn` (`i64` / `u64`, -1 / `u64::MAX` indicates unmapped / sparse)
 ///
+/// Note: Windows may round down the returned `StartingVcn` to the beginning of the
+/// extent covering `expected_starting_vcn`. Any extents prior to `expected_starting_vcn`
+/// are deduplicated, and overlapping extents are trimmed to preserve strict continuity.
+///
 /// Returns `(next_starting_vcn, extents)` on success.
 pub fn parse_retrieval_pointers_buffer(
     buf: &[u8],
@@ -858,7 +862,8 @@ pub fn parse_retrieval_pointers_buffer(
         return Err(MftError::IncompleteExtentMap);
     }
     let starting_vcn = u64_at(buf, 8);
-    if starting_vcn != expected_starting_vcn {
+    // Returned StartingVcn cannot be after the requested StartingVcn (would leave a gap).
+    if starting_vcn > expected_starting_vcn {
         return Err(MftError::IncompleteExtentMap);
     }
     let required_len = 16usize
@@ -869,29 +874,66 @@ pub fn parse_retrieval_pointers_buffer(
     }
 
     let mut extents = Vec::with_capacity(extent_count);
-    let mut current_vcn = starting_vcn;
+    let mut raw_vcn = starting_vcn;
+    let mut current_vcn = expected_starting_vcn;
 
     for i in 0..extent_count {
         let off = 16 + i * 16;
         let next_vcn = u64_at(buf, off);
         let lcn_raw = u64_at(buf, off + 8);
 
-        if next_vcn <= current_vcn {
+        // NextVcn must be strictly greater than raw_vcn (no zero-length or backwards extents).
+        if next_vcn <= raw_vcn {
             return Err(MftError::IncompleteExtentMap);
         }
 
-        let lcn = if lcn_raw == u64::MAX || lcn_raw as i64 == -1 {
+        let raw_start = raw_vcn;
+        raw_vcn = next_vcn;
+
+        // Skip extents that end before or at the expected starting VCN.
+        if next_vcn <= expected_starting_vcn {
+            continue;
+        }
+
+        let lcn_base = if lcn_raw == u64::MAX || lcn_raw as i64 == -1 {
             None
         } else {
             Some(lcn_raw)
         };
 
-        extents.push(MftExtent {
-            vcn_start: current_vcn,
-            next_vcn,
-            lcn,
-        });
-        current_vcn = next_vcn;
+        if raw_start < expected_starting_vcn {
+            // Trim overlapping extent to begin at expected_starting_vcn.
+            let offset_clusters = expected_starting_vcn - raw_start;
+            let lcn = match lcn_base {
+                Some(base) => Some(
+                    base.checked_add(offset_clusters)
+                        .ok_or(MftError::OutOfBounds)?,
+                ),
+                None => None,
+            };
+            extents.push(MftExtent {
+                vcn_start: expected_starting_vcn,
+                next_vcn,
+                lcn,
+            });
+            current_vcn = next_vcn;
+        } else {
+            // Extent starts at or after expected_starting_vcn. Ensure continuity.
+            if raw_start != current_vcn {
+                return Err(MftError::IncompleteExtentMap);
+            }
+            extents.push(MftExtent {
+                vcn_start: raw_start,
+                next_vcn,
+                lcn: lcn_base,
+            });
+            current_vcn = next_vcn;
+        }
+    }
+
+    // Must make strictly forward progress beyond expected_starting_vcn.
+    if current_vcn <= expected_starting_vcn || extents.is_empty() {
+        return Err(MftError::IncompleteExtentMap);
     }
 
     Ok((current_vcn, extents))
@@ -1750,38 +1792,156 @@ mod tests {
     }
 
     #[test]
-    fn multiple_retrieval_pointer_responses_simulated() {
-        // Chunk 1: StartingVcn = 0, Extents: 0..50 (LCN 1000), 50..100 (LCN 2000)
-        let mut chunk1 = vec![0u8; 48];
-        chunk1[0..4].copy_from_slice(&2u32.to_le_bytes());
-        chunk1[8..16].copy_from_slice(&0u64.to_le_bytes());
-        chunk1[16..24].copy_from_slice(&50u64.to_le_bytes());
-        chunk1[24..32].copy_from_slice(&1000u64.to_le_bytes());
-        chunk1[32..40].copy_from_slice(&100u64.to_le_bytes());
-        chunk1[40..48].copy_from_slice(&2000u64.to_le_bytes());
+    fn exact_starting_vcn_response() {
+        let mut buf = vec![0u8; 48];
+        buf[0..4].copy_from_slice(&2u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&100u64.to_le_bytes()); // StartingVcn = 100
+        buf[16..24].copy_from_slice(&150u64.to_le_bytes()); // NextVcn = 150
+        buf[24..32].copy_from_slice(&2000u64.to_le_bytes()); // Lcn = 2000
+        buf[32..40].copy_from_slice(&200u64.to_le_bytes()); // NextVcn = 200
+        buf[40..48].copy_from_slice(&3000u64.to_le_bytes()); // Lcn = 3000
 
-        let (next_vcn1, extents1) = parse_retrieval_pointers_buffer(&chunk1, 0).unwrap();
+        let (next_vcn, extents) = parse_retrieval_pointers_buffer(&buf, 100).unwrap();
+        assert_eq!(next_vcn, 200);
+        assert_eq!(extents.len(), 2);
+        assert_eq!(
+            extents[0],
+            MftExtent {
+                vcn_start: 100,
+                next_vcn: 150,
+                lcn: Some(2000),
+            }
+        );
+        assert_eq!(
+            extents[1],
+            MftExtent {
+                vcn_start: 150,
+                next_vcn: 200,
+                lcn: Some(3000),
+            }
+        );
+    }
+
+    #[test]
+    fn returned_starting_vcn_lower_than_requested_deduplicates_and_trims() {
+        // Requested VCN: 100.
+        // Windows returns StartingVcn = 60 (rounded down to extent containing 100).
+        // Extent 1: 60..80 @ 1000 (ends before 100, must be deduplicated/skipped).
+        // Extent 2: 80..140 @ 2000 (straddles 100, must be trimmed to 100..140 @ 2020).
+        // Extent 3: 140..200 @ 3000 (starts at 140, regular continuation).
+        let mut buf = vec![0u8; 64];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&60u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&80u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&140u64.to_le_bytes());
+        buf[40..48].copy_from_slice(&2000u64.to_le_bytes());
+        buf[48..56].copy_from_slice(&200u64.to_le_bytes());
+        buf[56..64].copy_from_slice(&3000u64.to_le_bytes());
+
+        let (next_vcn, extents) = parse_retrieval_pointers_buffer(&buf, 100).unwrap();
+        assert_eq!(next_vcn, 200);
+        assert_eq!(extents.len(), 2);
+        assert_eq!(
+            extents[0],
+            MftExtent {
+                vcn_start: 100,
+                next_vcn: 140,
+                lcn: Some(2020),
+            }
+        );
+        assert_eq!(
+            extents[1],
+            MftExtent {
+                vcn_start: 140,
+                next_vcn: 200,
+                lcn: Some(3000),
+            }
+        );
+    }
+
+    #[test]
+    fn no_progress_response_rejected() {
+        // Requested VCN: 100.
+        // Windows returns StartingVcn = 60, with extents ending at 80 and 100.
+        // All extents are <= 100, so no forward progress can be made.
+        let mut buf = vec![0u8; 48];
+        buf[0..4].copy_from_slice(&2u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&60u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&80u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&100u64.to_le_bytes());
+        buf[40..48].copy_from_slice(&2000u64.to_le_bytes());
+
+        assert_eq!(
+            parse_retrieval_pointers_buffer(&buf, 100).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+    }
+
+    #[test]
+    fn backwards_response_in_extents_rejected() {
+        let mut buf = vec![0u8; 48];
+        buf[0..4].copy_from_slice(&2u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&0u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&100u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        // NextVcn backwards: 100 -> 80
+        buf[32..40].copy_from_slice(&80u64.to_le_bytes());
+        buf[40..48].copy_from_slice(&2000u64.to_le_bytes());
+
+        assert_eq!(
+            parse_retrieval_pointers_buffer(&buf, 0).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+    }
+
+    #[test]
+    fn multiple_continuation_responses_with_rounded_down_starting_vcns() {
+        // Query 1: requested 0 -> returns 0..50 @ 1000, 50..100 @ 2000. NextVcn = 100.
+        let mut q1 = vec![0u8; 48];
+        q1[0..4].copy_from_slice(&2u32.to_le_bytes());
+        q1[8..16].copy_from_slice(&0u64.to_le_bytes());
+        q1[16..24].copy_from_slice(&50u64.to_le_bytes());
+        q1[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        q1[32..40].copy_from_slice(&100u64.to_le_bytes());
+        q1[40..48].copy_from_slice(&2000u64.to_le_bytes());
+
+        let (next_vcn1, extents1) = parse_retrieval_pointers_buffer(&q1, 0).unwrap();
         assert_eq!(next_vcn1, 100);
 
-        // Chunk 2: StartingVcn = 100, Extents: 100..150 (LCN 3000), 150..200 (LCN 4000)
-        let mut chunk2 = vec![0u8; 48];
-        chunk2[0..4].copy_from_slice(&2u32.to_le_bytes());
-        chunk2[8..16].copy_from_slice(&100u64.to_le_bytes());
-        chunk2[16..24].copy_from_slice(&150u64.to_le_bytes());
-        chunk2[24..32].copy_from_slice(&3000u64.to_le_bytes());
-        chunk2[32..40].copy_from_slice(&200u64.to_le_bytes());
-        chunk2[40..48].copy_from_slice(&4000u64.to_le_bytes());
+        // Query 2: requested 100 -> returns StartingVcn = 50, Extents: 50..100 @ 2000, 100..130 @ 3000.
+        let mut q2 = vec![0u8; 48];
+        q2[0..4].copy_from_slice(&2u32.to_le_bytes());
+        q2[8..16].copy_from_slice(&50u64.to_le_bytes());
+        q2[16..24].copy_from_slice(&100u64.to_le_bytes());
+        q2[24..32].copy_from_slice(&2000u64.to_le_bytes());
+        q2[32..40].copy_from_slice(&130u64.to_le_bytes());
+        q2[40..48].copy_from_slice(&3000u64.to_le_bytes());
 
-        let (next_vcn2, extents2) = parse_retrieval_pointers_buffer(&chunk2, 100).unwrap();
-        assert_eq!(next_vcn2, 200);
+        let (next_vcn2, extents2) = parse_retrieval_pointers_buffer(&q2, 100).unwrap();
+        assert_eq!(next_vcn2, 130);
+
+        // Query 3: requested 130 -> returns StartingVcn = 100, Extents: 100..160 @ 3000 (trimmed to 130..160 @ 3030), 160..200 @ 4000.
+        let mut q3 = vec![0u8; 48];
+        q3[0..4].copy_from_slice(&2u32.to_le_bytes());
+        q3[8..16].copy_from_slice(&100u64.to_le_bytes());
+        q3[16..24].copy_from_slice(&160u64.to_le_bytes());
+        q3[24..32].copy_from_slice(&3000u64.to_le_bytes());
+        q3[32..40].copy_from_slice(&200u64.to_le_bytes());
+        q3[40..48].copy_from_slice(&4000u64.to_le_bytes());
+
+        let (next_vcn3, extents3) = parse_retrieval_pointers_buffer(&q3, 130).unwrap();
+        assert_eq!(next_vcn3, 200);
 
         let mut all_extents = extents1;
         all_extents.extend(extents2);
+        all_extents.extend(extents3);
 
         let physical = validate_and_convert_extents(&all_extents, 200 * 4096, 4096, 10000).unwrap();
         assert_eq!(
             physical,
-            vec![(1000, 50), (2000, 50), (3000, 50), (4000, 50)]
+            vec![(1000, 50), (2000, 50), (3000, 30), (3030, 30), (4000, 40),]
         );
     }
 
@@ -1980,6 +2140,14 @@ mod tests {
         assert_eq!(processed_short, 5120);
         assert!(processed_short < 10240); // Incomplete coverage detected!
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn auto_handle_rejects_invalid_and_null() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        assert!(super::reader::AutoHandle::new(INVALID_HANDLE_VALUE).is_none());
+        assert!(super::reader::AutoHandle::new(std::ptr::null_mut()).is_none());
+    }
 }
 
 /// Volume access and MFT streaming (Windows only).
@@ -2050,12 +2218,41 @@ pub mod reader {
         }
     }
 
+    /// Small RAII wrapper for a valid Windows `HANDLE`.
+    /// Automatically closes the handle when dropped.
+    pub(crate) struct AutoHandle(HANDLE);
+
+    impl AutoHandle {
+        /// Wrap an opened `HANDLE`, returning `None` if it is null or `INVALID_HANDLE_VALUE`.
+        pub(crate) fn new(handle: HANDLE) -> Option<Self> {
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                None
+            } else {
+                Some(Self(handle))
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    impl Drop for AutoHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is guaranteed to be a valid, non-null, non-invalid HANDLE,
+            // closed exactly once when AutoHandle drops.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
     pub fn try_volume_scan(root: &Path, cancel: &AtomicBool) -> Result<ScanModel, String> {
         let drive = as_drive_root(root).ok_or("not a drive root")?;
         let path = wide(&format!(r"\\.\{drive}"));
         // SAFETY: path pointer valid for the call; read-only access with
         // maximum sharing so nothing else is disturbed.
-        let handle = unsafe {
+        let raw_handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 GENERIC_READ,
@@ -2066,16 +2263,11 @@ pub mod reader {
                 std::ptr::null_mut(),
             )
         };
-        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        let handle = AutoHandle::new(raw_handle).ok_or_else(|| {
             let err = io_err();
-            return Err(format!(
-                "cannot open volume {drive} (administrator rights required): {err}"
-            ));
-        }
-        let result = scan_with_handle(handle, &drive, root, cancel);
-        // SAFETY: created above, closed exactly once.
-        unsafe { CloseHandle(handle) };
-        result
+            format!("cannot open volume {drive} (administrator rights required): {err}")
+        })?;
+        scan_with_handle(handle.raw(), &drive, root, cancel)
     }
 
     fn seek_to(handle: HANDLE, byte_offset: u64) -> Result<(), String> {
@@ -2152,7 +2344,7 @@ pub mod reader {
     fn query_retrieval_pointers(drive: &str) -> Result<Vec<MftExtent>, String> {
         let mft_path = wide(&format!(r"\\.\{drive}\$MFT"));
         // SAFETY: path is a null-terminated wide string; open with read attributes and maximum sharing.
-        let handle = unsafe {
+        let raw_handle = unsafe {
             CreateFileW(
                 mft_path.as_ptr(),
                 windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
@@ -2163,9 +2355,8 @@ pub mod reader {
                 std::ptr::null_mut(),
             )
         };
-        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-            return Err(format!("cannot open $MFT on {drive}: {}", io_err()));
-        }
+        let handle = AutoHandle::new(raw_handle)
+            .ok_or_else(|| format!("cannot open $MFT on {drive}: {}", io_err()))?;
 
         let mut all_extents = Vec::new();
         let mut starting_vcn = 0u64;
@@ -2177,7 +2368,7 @@ pub mod reader {
             // SAFETY: valid handle, input buffer is 8 bytes, output buffer is allocated.
             let ok = unsafe {
                 DeviceIoControl(
-                    handle,
+                    handle.raw(),
                     FSCTL_GET_RETRIEVAL_POINTERS,
                     in_buf.as_ptr().cast(),
                     in_buf.len() as u32,
@@ -2202,7 +2393,6 @@ pub mod reader {
                     parse_retrieval_pointers_buffer(&out_buf[..returned as usize], starting_vcn)
                         .map_err(|e| format!("parse retrieval pointers chunk failed: {e:?}"))?;
                 if extents.is_empty() || next_vcn <= starting_vcn {
-                    unsafe { CloseHandle(handle) };
                     return Err("retrieval pointers progress stalled".into());
                 }
                 all_extents.extend(extents);
@@ -2210,12 +2400,10 @@ pub mod reader {
             } else if err == ERROR_HANDLE_EOF {
                 break;
             } else {
-                unsafe { CloseHandle(handle) };
                 return Err(format!("FSCTL_GET_RETRIEVAL_POINTERS failed: {err}"));
             }
         }
 
-        unsafe { CloseHandle(handle) };
         Ok(all_extents)
     }
 
