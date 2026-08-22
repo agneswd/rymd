@@ -187,10 +187,8 @@ impl WindowsFilesystem {
                 }
             }
 
-            let chain_done;
             match parse_id_both_dir_info(&buf) {
-                ParseOutcome::Records(records, terminated) => {
-                    chain_done = terminated;
+                ParseOutcome::Records(records, _terminated) => {
                     for r in records {
                         let units = &buf[r.name_offset..r.name_offset + r.name_units * 2];
                         name_units.clear();
