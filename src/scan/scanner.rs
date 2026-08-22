@@ -61,6 +61,9 @@ struct Shared {
     errors: Counter,
     cancelled: Arc<AtomicBool>,
     current: Mutex<PathBuf>,
+    /// Set when a worker panics or the pool stalls; surfaced as a scan
+    /// failure instead of a silent hang.
+    panic_msg: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -257,6 +260,7 @@ pub fn spawn_scan(root: PathBuf, options: ScanOptions) -> ScanJob {
             errors: Counter::new(0),
             cancelled: cancelled.clone(),
             current: Mutex::new(root.clone()),
+            panic_msg: Mutex::new(None),
         }),
         Err(error) => {
             let _ = tx.send(ScanOutcome::Failed { path: root, error });
@@ -304,6 +308,14 @@ pub fn spawn_scan(root: PathBuf, options: ScanOptions) -> ScanJob {
 
         run_pool(&live_for_pool, workers);
 
+        if let Some(msg) = live_for_pool.panic_msg.lock().take() {
+            let _ = tx.send(ScanOutcome::Failed {
+                path: root,
+                error: msg,
+            });
+            return;
+        }
+
         let was_cancelled = cancelled_in_scan.load(Ordering::Relaxed);
         let mut guard = live_for_pool.model.lock();
         let mut model = guard.take();
@@ -340,6 +352,7 @@ fn failed_shared() -> Shared {
         errors: Counter::new(1),
         cancelled: Arc::new(AtomicBool::new(true)),
         current: Mutex::new(PathBuf::new()),
+        panic_msg: Mutex::new(None),
     }
 }
 
@@ -360,10 +373,32 @@ fn run_pool(shared: &Arc<Shared>, workers: usize) {
     for local in locals {
         let s = shared.clone();
         let stealers = stealers.clone();
-        joins.push(thread::spawn(move || worker_loop(&s, local, &stealers)));
+        joins.push(thread::spawn(move || {
+            // A panicking worker would skip its job completion, deadlocking
+            // every sibling; surface the panic instead of swallowing it.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_loop(&s, local, &stealers)
+            }));
+            if let Err(panic) = result {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|p| p.to_string()))
+                    .unwrap_or_else(|| "worker panicked".into());
+                *s.panic_msg.lock() = Some(msg);
+            }
+        }));
     }
     for j in joins {
         let _ = j.join();
+    }
+    // Every worker has exited. If jobs are still outstanding, something
+    // went wrong that must not turn into a silent stall.
+    if !shared.sched.is_quiet() && shared.panic_msg.lock().is_none() {
+        *shared.panic_msg.lock() = Some(format!(
+            "scan stalled with {} outstanding jobs",
+            shared.sched.outstanding()
+        ));
     }
 }
 
