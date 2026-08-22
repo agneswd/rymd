@@ -1,19 +1,26 @@
 //! Treemap rendering.
 //!
-//! [`TreemapElement`] is the one custom visual control in the app. It
-//! measures its container during prepaint (the same approach gpui-component's
-//! virtual list uses), runs the pure squarify layout from `layout.rs`, and
-//! then lays out and paints one interactive `div` per rectangle.
+//! [`TreemapElement`] is a custom-painted control: rectangles are drawn as
+//! quads at exact pixel bounds and labels are shaped once per layout and
+//! painted directly. Nothing runs taffy layout per tile, so a
+//! thousand-tile treemap costs about the same as ten.
+//!
+//! Highlights stroke the inside of each tile's own bounds, which means
+//! edge and corner tiles can never have their ring clipped by the
+//! container mask. Model data (names, sizes) is read only when the layout
+//! cache rebuilds; hover tooltips resolve their path lazily at display
+//! time.
 
-use gpui::{
-    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Size, Stateful,
-    StatefulInteractiveElement as _, Styled, WeakEntity, Window, div, point, px,
-};
-use gpui_component::{ActiveTheme as _, tooltip::Tooltip};
 use std::sync::Arc;
 
+use gpui::{
+    App, Bounds, Corners, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
+    InteractiveElement as _, IntoElement, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    SharedString, Size, Styled, Window, point, px,
+};
 use parking_lot::RwLock;
+
+use gpui_component::ActiveTheme as _;
 
 use crate::model::{HARDLINK_SHARED, MOUNT_BOUNDARY, NodeId, ScanModel};
 use crate::scan::options::SizeMetric;
@@ -24,20 +31,22 @@ use super::layout::{FRect, TreemapItem, TreemapRect, squarify};
 
 /// Rectangles under this many pixels on a side are not drawn.
 const MIN_VISIBLE: f32 = 3.0;
-/// Padding between the container edge and the outermost rectangles, so
-/// selection outlines and labels never get clipped.
+/// Padding between the container edge and the outermost rectangles.
 const EDGE_PAD: f32 = 4.0;
 /// Hard cap on rendered rectangles so huge folders stay cheap to draw.
 const MAX_RECTS: usize = 1200;
 
 pub struct TreemapElement {
+    /// Styling container (border, rounding, background, hit area).
     base: gpui::Stateful<gpui::Div>,
     items: Vec<TreemapItem>,
     model: Arc<RwLock<ScanModel>>,
     dir_total: u64,
     metric: SizeMetric,
     selected: Option<u32>,
-    shell: WeakEntity<AppShell>,
+    /// Node id currently under the mouse, tracked by the shell.
+    hovered: Option<u32>,
+    shell: gpui::WeakEntity<AppShell>,
     /// Bumped by the shell whenever inputs behind the weights change
     /// (navigation, filter, metric, deletions). Part of the cache key so
     /// look-alike directories can never serve stale rectangles.
@@ -45,22 +54,25 @@ pub struct TreemapElement {
 }
 
 impl TreemapElement {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         items: Vec<TreemapItem>,
         model: Arc<RwLock<ScanModel>>,
         dir_total: u64,
         metric: SizeMetric,
         selected: Option<u32>,
-        shell: WeakEntity<AppShell>,
+        hovered: Option<u32>,
+        shell: gpui::WeakEntity<AppShell>,
         version: u64,
     ) -> Self {
         Self {
-            base: div().id("treemap").size_full().relative().overflow_hidden(),
+            base: gpui::div().id("treemap").size_full().relative(),
             items,
             model,
             dir_total,
             metric,
             selected,
+            hovered,
             shell,
             version,
         }
@@ -75,7 +87,7 @@ impl IntoElement for TreemapElement {
 }
 
 impl ParentElement for TreemapElement {
-    fn extend(&mut self, _: impl IntoIterator<Item = AnyElement>) {}
+    fn extend(&mut self, _: impl IntoIterator<Item = gpui::AnyElement>) {}
 }
 
 impl Styled for TreemapElement {
@@ -92,15 +104,26 @@ struct LayoutKey {
     version: u64,
 }
 
-#[derive(Default)]
+/// Per-rectangle display data, cached alongside the geometry so ordinary
+/// frames never touch the model.
+#[derive(Clone)]
+struct RectVisual {
+    name: SharedString,
+    sublabel: Option<SharedString>,
+    level: usize,
+    selected: bool,
+}
+
+#[derive(Default, Clone)]
 struct TreemapState {
     key: Option<LayoutKey>,
     rects: Vec<TreemapRect>,
+    visuals: Vec<RectVisual>,
+    /// Shaped labels keyed by rect index; cleared on relayout.
+    labels: std::collections::HashMap<usize, gpui::ShapedLine>,
 }
 
-pub struct PreparedChildren {
-    pub children: Vec<(TreemapRect, AnyElement)>,
-}
+pub struct PreparedChildren {}
 
 impl Element for TreemapElement {
     type RequestLayoutState = PreparedChildren;
@@ -120,7 +143,7 @@ impl Element for TreemapElement {
         inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         let layout_id = self.base.interactivity().request_layout(
             global_id,
             inspector_id,
@@ -128,12 +151,7 @@ impl Element for TreemapElement {
             cx,
             |style, window, cx| window.request_layout(style, None, cx),
         );
-        (
-            layout_id,
-            PreparedChildren {
-                children: Vec::new(),
-            },
-        )
+        (layout_id, PreparedChildren {})
     }
 
     fn prepaint(
@@ -141,25 +159,37 @@ impl Element for TreemapElement {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
+        _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let Some(global_id) = global_id else {
+            self.base.interactivity().prepaint(
+                global_id,
+                inspector_id,
+                bounds,
+                bounds.size,
+                window,
+                cx,
+                |_style, _origin, _hitbox, _window, _cx| {},
+            );
+            return;
+        };
         let width = f32::from(bounds.size.width.max(px(0.0)));
         let height = f32::from(bounds.size.height.max(px(0.0)));
 
-        // Element state persists across frames; relayout only when the
-        // inputs actually change.
-        let rects =
-            window.with_element_state(global_id.unwrap(), |state: Option<TreemapState>, _| {
-                let mut state = state.unwrap_or_default();
+        // Build or load the cached geometry + visuals. The only model read
+        // in steady-state frames happens inside this closure when the key
+        // actually changed.
+        let mut state: TreemapState =
+            window.with_element_state(global_id, |stored: Option<TreemapState>, _| {
+                let mut state: TreemapState = stored.unwrap_or_default();
                 let key = LayoutKey {
                     width,
                     height,
                     version: self.version,
                 };
-                let unchanged = state.key == Some(key);
-                if !unchanged {
+                if state.key != Some(key) {
                     state.rects = squarify(
                         &self.items,
                         FRect::new(
@@ -169,55 +199,302 @@ impl Element for TreemapElement {
                             (height - 2.0 * EDGE_PAD).max(0.0),
                         ),
                     );
+                    state.rects.truncate(MAX_RECTS);
+                    let metric = self.metric;
+                    let dir_total = self.dir_total;
+                    let selected = self.selected;
+                    let model = self.model.clone();
+                    state.visuals = state
+                        .rects
+                        .iter()
+                        .map(|r| {
+                            let node_id = NodeId(r.node_id);
+                            let (name, size, items) = {
+                                let m = model.read();
+                                let n = m.node(node_id);
+                                (
+                                    n.name.to_string_lossy().into_owned(),
+                                    metric.pick(n.agg_logical, n.agg_allocated),
+                                    n.file_count + n.dir_count,
+                                )
+                            };
+                            let ratio = if dir_total > 0 {
+                                (size as f32 / dir_total as f32).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let level = if ratio >= 0.5 {
+                                4
+                            } else if ratio >= 0.25 {
+                                3
+                            } else if ratio >= 0.1 {
+                                2
+                            } else if ratio >= 0.03 {
+                                1
+                            } else {
+                                0
+                            };
+                            let sublabel = if r.h >= 52.0 && r.w >= 90.0 && size > 0 {
+                                let mut s = format_size(size);
+                                if items > 0 {
+                                    s.push_str(" · ");
+                                    s.push_str(&format_count(items));
+                                }
+                                Some(s.into())
+                            } else {
+                                None
+                            };
+                            RectVisual {
+                                name: name.into(),
+                                sublabel,
+                                level,
+                                selected: selected == Some(r.node_id),
+                            }
+                        })
+                        .collect();
+                    state.labels.clear();
                     state.key = Some(key);
                 }
-
-                let drawable = state
-                    .rects
-                    .iter()
-                    .filter(|r| r.w >= MIN_VISIBLE && r.h >= MIN_VISIBLE)
-                    .take(MAX_RECTS)
-                    .copied()
-                    .collect::<Vec<_>>();
-                (drawable, state)
+                // Hand back for painting AND persist in one move.
+                let handed_out = state.clone();
+                (handed_out, state)
             });
 
-        let mut prepared: Vec<(TreemapRect, AnyElement)> = rects
-            .into_iter()
-            .map(|r| {
-                let el = self.render_rect(r, cx);
-                (r, el)
-            })
-            .collect();
+        // Hover tracking: the shell owns the hovered node so the next
+        // frame repaints with the new highlight.
+        let rects_hover = state.rects.clone();
+        let current_hover = self.hovered;
+        let shell_for_hover = self.shell.clone();
+        window.on_mouse_event::<MouseMoveEvent>(move |event, phase, _window, cx| {
+            if phase != gpui::DispatchPhase::Capture {
+                return;
+            }
+            let hit_node = if bounds.contains(&event.position) {
+                hit_test(&rects_hover, event.position - bounds.origin)
+                    .map(|ix| rects_hover[ix].node_id)
+            } else {
+                None
+            };
+            if hit_node != current_hover {
+                let _ = shell_for_hover.update(cx, |shell, cx| {
+                    shell.treemap_hovered = hit_node;
+                    cx.notify();
+                });
+            }
+        });
+
+        // Click / double-click dispatch.
+        let rects_click = state.rects.clone();
+        let shell = self.shell.clone();
+        window.on_mouse_event::<MouseUpEvent>(move |event, phase, _window, cx| {
+            if phase != gpui::DispatchPhase::Capture || !bounds.contains(&event.position) {
+                return;
+            }
+            let Some(hit) = hit_test(&rects_click, event.position - bounds.origin) else {
+                return;
+            };
+            let node_id = NodeId(rects_click[hit].node_id);
+            let double = event.click_count >= 2;
+            let _ = shell.update(cx, |shell, cx| {
+                if double {
+                    shell.activate_node(node_id, cx);
+                } else {
+                    shell.select_node(node_id, cx);
+                }
+            });
+        });
+
+        // Paint inside the container's content mask.
+        let theme = cx.theme();
+        let primary = theme.primary;
+        let foreground = theme.foreground;
+        let muted = theme.muted_foreground;
+        let background = theme.background;
+        let popover = theme.popover;
+        let border_col = theme.border;
+        let font = gpui::Font {
+            family: theme.font_family.clone(),
+            features: Default::default(),
+            fallbacks: None,
+            weight: gpui::FontWeight::NORMAL,
+            style: gpui::FontStyle::Normal,
+        };
 
         self.base.interactivity().prepaint(
-            global_id,
+            Some(global_id),
             inspector_id,
             bounds,
             bounds.size,
             window,
             cx,
             |_style, _origin, _hitbox, window, cx| {
-                let mask = gpui::ContentMask { bounds };
-                window.with_content_mask(Some(mask), |window| {
-                    for (r, el) in prepared.drain(..) {
-                        let mut el = el;
-                        el.layout_as_root(
-                            Size::new(
-                                gpui::AvailableSpace::Definite(px(r.w)),
-                                gpui::AvailableSpace::Definite(px(r.h)),
-                            ),
-                            window,
-                            cx,
-                        );
-                        // prepaint_at takes window coordinates: offset the
-                        // layout-relative rect by the container origin.
-                        el.prepaint_at(bounds.origin + point(px(r.x), px(r.y)), window, cx);
-                        request_layout.children.push((r, el));
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    let opacity = [0.16f32, 0.22, 0.29, 0.36, 0.44];
+                    for (ix, r) in state.rects.iter().enumerate() {
+                        if r.w < MIN_VISIBLE || r.h < MIN_VISIBLE {
+                            continue;
+                        }
+                        let visual = &state.visuals[ix];
+                        let tile_bounds = Bounds {
+                            origin: bounds.origin + point(px(r.x), px(r.y)),
+                            size: Size::new(px((r.w - 1.0).max(1.0)), px((r.h - 1.0).max(1.0))),
+                        };
+                        let fill_alpha = if visual.selected {
+                            0.55
+                        } else {
+                            opacity[visual.level]
+                        };
+                        window.paint_quad(gpui::quad(
+                            tile_bounds,
+                            Corners::all(px(2.0)),
+                            primary.opacity(fill_alpha),
+                            Edges::default(),
+                            background,
+                            gpui::BorderStyle::Solid,
+                        ));
+                        // Inset ring: separator by default, accent when hot.
+                        // Drawn strictly inside the tile bounds, so tiles
+                        // touching any container edge keep their highlight.
+                        let ring = if visual.selected || self.hovered == Some(r.node_id) {
+                            primary
+                        } else {
+                            background
+                        };
+                        window.paint_quad(gpui::quad(
+                            tile_bounds,
+                            Corners::all(px(2.0)),
+                            gpui::transparent_black(),
+                            Edges::all(px(1.0)),
+                            ring,
+                            gpui::BorderStyle::Solid,
+                        ));
+                    }
+
+                    // Labels where they fit.
+                    for (ix, r) in state.rects.iter().enumerate() {
+                        if r.w < MIN_VISIBLE || r.h < MIN_VISIBLE {
+                            continue;
+                        }
+                        let show_full = r.h >= 38.0 && r.w >= 90.0;
+                        let show_name_only = !show_full && r.w >= 56.0 && r.h >= 18.0;
+                        if !show_full && !show_name_only {
+                            continue;
+                        }
+                        let visual = &state.visuals[ix];
+                        let tile_origin = bounds.origin + point(px(r.x), px(r.y));
+                        if show_full {
+                            let line = state.labels.entry(ix).or_insert_with(|| {
+                                let run = gpui::TextRun {
+                                    len: visual.name.len(),
+                                    font: font.clone(),
+                                    color: foreground,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                window.text_system().shape_line(
+                                    visual.name.clone(),
+                                    px(12.0),
+                                    &[run],
+                                    None,
+                                )
+                            });
+                            let origin = tile_origin + point(px(4.0), px(4.0));
+                            let _ = line.paint(origin, px(14.5), window, cx);
+                            if let Some(sub) = &visual.sublabel {
+                                let run = gpui::TextRun {
+                                    len: sub.len(),
+                                    font: font.clone(),
+                                    color: muted,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                let shaped = window.text_system().shape_line(
+                                    sub.clone(),
+                                    px(10.5),
+                                    &[run],
+                                    None,
+                                );
+                                let _ = shaped.paint(
+                                    tile_origin + point(px(4.0), px(19.0)),
+                                    px(13.0),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        } else {
+                            let run = gpui::TextRun {
+                                len: visual.name.len(),
+                                font: font.clone(),
+                                color: foreground,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let shaped = window.text_system().shape_line(
+                                visual.name.clone(),
+                                px(10.5),
+                                &[run],
+                                None,
+                            );
+                            let _ = shaped.paint(
+                                tile_origin + point(px(3.0), px(3.0)),
+                                px(12.0),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+
+                    // Tooltip while hovering, docked top-right. The path is
+                    // read from the model only now: lazily, at display time.
+                    if let Some(hover_node) = self.hovered
+                        && let Some(r) = state.rects.iter().find(|r| r.node_id == hover_node)
+                    {
+                        let node_id = NodeId(r.node_id);
+                        let (name, size, items, is_dir, hardlink, mount, path) = {
+                            let m = self.model.read();
+                            let n = m.node(node_id);
+                            (
+                                n.name.to_string_lossy().into_owned(),
+                                self.metric.pick(n.agg_logical, n.agg_allocated),
+                                n.file_count + n.dir_count,
+                                n.is_dir(),
+                                n.flags & HARDLINK_SHARED != 0,
+                                n.flags & MOUNT_BOUNDARY != 0,
+                                m.path_of(node_id).to_string_lossy().into_owned(),
+                            )
+                        };
+                        let mut lines: Vec<(SharedString, gpui::Hsla)> =
+                            vec![(name.into(), foreground)];
+                        lines.push((format_size(size).into(), muted));
+                        if is_dir && self.dir_total > 0 {
+                            lines.push((
+                                format!(
+                                    "{}, {} items",
+                                    format_percent(size, self.dir_total),
+                                    format_count(items)
+                                )
+                                .into(),
+                                muted,
+                            ));
+                        }
+                        if hardlink {
+                            lines.push(("Hard link: storage counted elsewhere".into(), muted));
+                        }
+                        if mount {
+                            lines.push(("Mount point: not scanned".into(), muted));
+                        }
+                        lines.push((path.into(), muted));
+                        paint_tooltip(window, cx, bounds, popover, border_col, &font, &lines);
                     }
                 });
             },
         );
+
+        // Persist any label/hover mutations made above.
+        window.with_element_state(global_id, |_: Option<TreemapState>, _| ((), state));
     }
 
     fn paint(
@@ -225,7 +502,7 @@ impl Element for TreemapElement {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
+        _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
@@ -237,220 +514,63 @@ impl Element for TreemapElement {
             None,
             window,
             cx,
-            |_, window, cx| {
-                for (_, item) in &mut request_layout.children {
-                    item.paint(window, cx);
-                }
-            },
+            |_, _, _| {},
         );
     }
 }
 
-impl TreemapElement {
-    fn render_rect(&self, r: TreemapRect, cx: &App) -> AnyElement {
-        let theme = cx.theme();
-        let node_id = NodeId(r.node_id);
-        let info = {
-            let m = self.model.read();
-            let n = m.node(node_id);
-            (
-                n.name.to_string_lossy().into_owned(),
-                self.metric.pick(n.agg_logical, n.agg_allocated),
-                n.file_count + n.dir_count,
-                m.path_of(node_id).to_string_lossy().into_owned(),
-                n.is_dir(),
-                n.flags & HARDLINK_SHARED != 0,
-                n.flags & MOUNT_BOUNDARY != 0,
-            )
-        };
-        let (name, size, items, path, is_dir, hardlink, mount) = info;
-
-        // One accent color, five depth levels by share of the directory.
-        let ratio = if self.dir_total > 0 {
-            (size as f32 / self.dir_total as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let level = if ratio >= 0.5 {
-            4
-        } else if ratio >= 0.25 {
-            3
-        } else if ratio >= 0.1 {
-            2
-        } else if ratio >= 0.03 {
-            1
-        } else {
-            0
-        };
-        let opacity = [0.16f32, 0.22, 0.29, 0.36, 0.44][level];
-        let selected = self.selected == Some(r.node_id);
-
-        let fill = if selected {
-            theme.primary.opacity(0.55)
-        } else {
-            theme.primary.opacity(opacity)
-        };
-
-        let show_full_label = r.h >= 38.0 && (r.w >= 90.0 || (is_dir && r.w >= 70.0));
-        let show_name_only = !show_full_label && r.w >= 56.0 && r.h >= 18.0;
-
-        let mut rect_div: Stateful<gpui::Div> = div()
-            .id(("treemap-node", r.node_id as u64))
-            .absolute()
-            .left(px(r.x))
-            .top(px(r.y))
-            .w(px((r.w - 1.0).max(1.0)))
-            .h(px((r.h - 1.0).max(1.0)))
-            .bg(fill)
-            .border_1()
-            .border_color(theme.background)
-            .rounded(px(2.0))
-            .cursor_pointer()
-            .hover(|s| s.border_color(theme.primary));
-
-        if show_full_label {
-            let mut label_col = div().flex().flex_col().p_1().overflow_hidden().child(
-                div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .truncate()
-                    .child(name.clone()),
-            );
-            if r.h >= 52.0 {
-                label_col = label_col.child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "{}{}",
-                            format_size(size),
-                            if is_dir && items > 0 {
-                                format!(" · {}", format_count(items))
-                            } else {
-                                String::new()
-                            }
-                        )),
-                );
-            }
-            rect_div = rect_div.child(label_col);
-        } else if show_name_only {
-            rect_div = rect_div.child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(theme.foreground)
-                    .truncate()
-                    .child(name.clone()),
-            );
-        }
-
-        let shell = self.shell.clone();
-        rect_div = rect_div.on_click(move |event, _, cx| {
-            let double = matches!(
-                event,
-                gpui::ClickEvent::Mouse(m) if m.up.click_count >= 2
-            );
-            let _ = shell.update(cx, |shell, cx| {
-                if double {
-                    shell.activate_node(node_id, cx);
-                } else {
-                    shell.select_node(node_id, cx);
-                }
-            });
-        });
-
-        let data = TooltipData {
-            name: name.clone(),
-            size,
-            items,
-            is_dir,
-            hardlink,
-            mount,
-            dir_total: self.dir_total,
-            path: path.clone(),
-        };
-        rect_div = rect_div.tooltip(move |window, cx| {
-            let data = data.clone();
-            Tooltip::element(move |_, cx| tooltip_body(cx, &data)).build(window, cx)
-        });
-
-        rect_div.into_any_element()
-    }
+fn hit_test(rects: &[TreemapRect], pos: gpui::Point<Pixels>) -> Option<usize> {
+    let x = f32::from(pos.x);
+    let y = f32::from(pos.y);
+    rects
+        .iter()
+        .position(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
 }
 
-#[derive(Clone)]
-struct TooltipData {
-    name: String,
-    size: u64,
-    items: u64,
-    is_dir: bool,
-    hardlink: bool,
-    mount: bool,
-    dir_total: u64,
-    path: String,
-}
-
-fn tooltip_body(cx: &gpui::App, d: &TooltipData) -> gpui::AnyElement {
-    use gpui_component::{h_flex, v_flex};
-    let theme = cx.theme();
-    let (name, size, items, is_dir, hardlink, mount, dir_total, path) = (
-        &d.name,
-        d.size,
-        d.items,
-        d.is_dir,
-        d.hardlink,
-        d.mount,
-        d.dir_total,
-        &d.path,
+fn paint_tooltip(
+    window: &mut Window,
+    cx: &mut App,
+    container: Bounds<Pixels>,
+    bg: gpui::Hsla,
+    border: gpui::Hsla,
+    font: &gpui::Font,
+    lines: &[(SharedString, gpui::Hsla)],
+) {
+    let pad = px(8.0);
+    let line_h = px(16.0);
+    let max_w = px(420.0);
+    let width = max_w.min(container.size.width * 0.7);
+    let height = line_h * lines.len() as f32 + pad * 2.0;
+    let origin = point(
+        container.origin.x + container.size.width - width - px(6.0),
+        container.origin.y + px(6.0),
     );
-
-    let mut col = v_flex()
-        .gap_0p5()
-        .child(
-            h_flex().child(
-                div()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(name.to_string()),
-            ),
-        )
-        .child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child(format_size(size)),
-        );
-
-    if is_dir {
-        col = col.child(div().text_color(theme.muted_foreground).child(format!(
-            "{}, {} items",
-            format_percent(size, dir_total),
-            format_count(items)
-        )));
-    } else if dir_total > 0 {
-        col = col.child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child(format_percent(size, dir_total)),
-        );
+    let card = Bounds {
+        origin,
+        size: Size::new(width, height),
+    };
+    window.paint_quad(gpui::quad(
+        card,
+        Corners::all(px(4.0)),
+        bg,
+        Edges::all(px(1.0)),
+        border,
+        gpui::BorderStyle::Solid,
+    ));
+    let mut y = origin.y + pad;
+    for (text, color) in lines {
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: *color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text.clone(), px(12.0), &[run], None);
+        let _ = shaped.paint(point(origin.x + pad, y), line_h, window, cx);
+        y += line_h;
     }
-    if hardlink {
-        col = col.child(
-            div()
-                .text_color(theme.warning)
-                .child("Hard link: storage counted at another path"),
-        );
-    }
-    if mount {
-        col = col.child(
-            div()
-                .text_color(theme.info)
-                .child("Mount point: contents not scanned"),
-        );
-    }
-    col.child(
-        div()
-            .text_color(theme.muted_foreground)
-            .text_size(px(11.0))
-            .child(path.to_string()),
-    )
-    .into_any_element()
 }

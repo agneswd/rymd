@@ -47,6 +47,8 @@ pub struct AppShell {
     pub search_index: Option<Arc<SearchIndex>>,
     /// Non-empty while a search query is active.
     pub search_results: Vec<NodeId>,
+    /// Node id under the mouse in the treemap, for highlight + tooltip.
+    pub treemap_hovered: Option<u32>,
     /// The query the current results belong to (normalized).
     pub search_query_active: String,
     /// Guards stale background searches from overwriting newer ones.
@@ -138,6 +140,7 @@ impl AppShell {
             search_input,
             search_index: None,
             search_results: Vec::new(),
+            treemap_hovered: None,
             search_query_active: String::new(),
             search_generation: 0,
             table,

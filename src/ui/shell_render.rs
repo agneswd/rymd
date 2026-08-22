@@ -744,6 +744,7 @@ impl AppShell {
                 dir_total,
                 self.state.metric,
                 selected,
+                self.treemap_hovered,
                 cx.entity().downgrade(),
                 self.view_version,
             )
