@@ -446,7 +446,7 @@ fn process_dir(
     st.report_current(shared, &task.path);
 
     let inline_limit = fs.inline_limit();
-    let mut batch = match fs.enumerate(&task.path, inline_limit.min(CHUNK)) {
+    let mut batch = match fs.enumerate(&task.path, inline_limit) {
         Ok(b) => b,
         Err(e) => {
             st.errors += 1;
