@@ -245,12 +245,12 @@ fn record_to_md(r: &super::win_enum::DirRecord, device: u64) -> FileMetadata {
     let allocated = match kind {
         // Real allocation from the record: sparse, compressed and unusual
         // cluster sizes all land here correctly.
-        EntryKind::File => r.allocation_size.max(0) as u64,
+        EntryKind::File => r.allocation_size,
         _ => 0,
     };
     FileMetadata {
         kind,
-        logical: r.end_of_file.max(0) as u64,
+        logical: r.end_of_file,
         allocated,
         modified_ms: super::win_enum::filetime_to_unix_ms(r.last_write_filetime),
         device,

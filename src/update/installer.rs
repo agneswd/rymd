@@ -241,7 +241,7 @@ fn set_executable(_path: &Path) -> Result<()> {
 fn in_program_files(exe: &Path) -> bool {
     ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
         .iter()
-        .filter_map(|k| std::env::var_os(k))
+        .filter_map(std::env::var_os)
         .any(|root| exe.starts_with(PathBuf::from(root)))
 }
 

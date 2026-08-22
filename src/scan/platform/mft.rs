@@ -980,7 +980,7 @@ pub mod reader {
                     next_record_no += 1;
                     consume_record(record_no, &mut record, &mut entries);
                 }
-                if next_record_no as u64 * rs as u64 >= vd.mft_valid_length {
+                if next_record_no * rs as u64 >= vd.mft_valid_length {
                     break;
                 }
             }
@@ -1000,10 +1000,10 @@ pub mod reader {
         if !super::record_in_use(record) {
             return;
         }
-        if record_no >= META_RECORDS || record_no == ROOT_RECORD {
-            if let Ok(entry) = extract_entry(record_no, record) {
-                entries.push(entry);
-            }
+        if (record_no >= META_RECORDS || record_no == ROOT_RECORD)
+            && let Ok(entry) = extract_entry(record_no, record)
+        {
+            entries.push(entry);
         }
     }
 
