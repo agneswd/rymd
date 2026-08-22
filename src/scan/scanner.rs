@@ -283,25 +283,22 @@ pub fn spawn_scan(root: PathBuf, options: ScanOptions) -> ScanJob {
         // from the master file table; anything else uses the pool.
         #[cfg(target_os = "windows")]
         {
-            if crate::scan::platform::mft::reader::as_drive_root(&root).is_some() {
-                match crate::scan::platform::mft::reader::try_volume_scan(&root, &cancelled_in_scan)
-                {
-                    Ok(mut model) => {
-                        let agg_started = Instant::now();
-                        model.aggregate();
-                        let mut model = model;
-                        model.aggregate_ms = agg_started.elapsed().as_secs_f64() * 1000.0;
-                        model.duration_ms = started.elapsed().as_millis() as u64;
-                        model.backend = "ntfs-mft";
-                        model.was_cancelled = cancelled_in_scan.load(Ordering::Relaxed);
-                        let _ = tx.send(ScanOutcome::Completed {
-                            model: Box::new(model),
-                            cancelled: false,
-                        });
-                        return;
-                    }
-                    Err(_) => {} // fall back to directory traversal
-                }
+            if crate::scan::platform::mft::reader::as_drive_root(&root).is_some()
+                && let Ok(mut model) =
+                    crate::scan::platform::mft::reader::try_volume_scan(&root, &cancelled_in_scan)
+            {
+                let agg_started = Instant::now();
+                model.aggregate();
+                model.aggregate_ms = agg_started.elapsed().as_secs_f64() * 1000.0;
+                model.duration_ms = started.elapsed().as_millis() as u64;
+                model.backend = "ntfs-mft";
+                model.was_cancelled = cancelled_in_scan.load(Ordering::Relaxed);
+                let _ = tx.send(ScanOutcome::Completed {
+                    model: Box::new(model),
+                    cancelled: false,
+                });
+                return;
+                // Err: fall back to directory traversal below.
             }
         }
 
