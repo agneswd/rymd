@@ -38,7 +38,12 @@ impl AppShell {
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(gpui::img("icon.png").size(px(16.)))
+                .child(
+                    gpui::svg()
+                        .path("rymd.svg")
+                        .text_color(theme.foreground)
+                        .size(px(16.)),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -123,17 +128,24 @@ impl AppShell {
         bar = bar.child(div().w(px(200.)).child(filter_input));
 
         // Global search over the completed scan.
-        if self.search_index.is_some() {
+        if self.model.is_some() {
             let hits = self.search_results.len();
             let mut search_field = Input::new(&self.search_input)
                 .prefix(Icon::new(IconName::Search).small())
                 .cleanable(true);
-            if hits > 0 {
+            if !self.search_query_active.is_empty() {
                 search_field = search_field.suffix(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(format_count(hits as u64)),
+                );
+            } else if self.search_index.is_none() {
+                search_field = search_field.suffix(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("indexing..."),
                 );
             }
             bar = bar.child(div().w(px(240.)).child(search_field));
@@ -377,7 +389,7 @@ impl AppShell {
         }
 
         // Search results replace the body while a query is active.
-        if !self.search_results.is_empty() {
+        if !self.search_query_active.is_empty() {
             return self.render_search_results(cx).into_any_element();
         }
 
@@ -392,6 +404,47 @@ impl AppShell {
         let metric = self.state.metric;
         let total = self.search_results.len();
         const MAX_ROWS: usize = 500;
+
+        if total == 0 {
+            if self.search_index.is_none() {
+                return v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(Spinner::new())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Building search index..."),
+                    )
+                    .into_any_element();
+            }
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Search)
+                        .size_8()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child("0 matches"),
+                )
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                    SharedString::from(format!(
+                        "No files or folders match \"{}\"",
+                        self.search_query_active
+                    )),
+                ))
+                .into_any_element();
+        }
 
         let shell = cx.entity().downgrade();
         let rows: Vec<gpui::AnyElement> = self
@@ -489,11 +542,13 @@ impl AppShell {
             )
             .child(
                 div()
+                    .id("search-results-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .child(v_flex().gap_0().children(rows)),
             )
+            .into_any_element()
     }
 
     fn render_empty_state(&self, cx: &Context<Self>) -> impl IntoElement {

@@ -118,6 +118,15 @@ impl AppShell {
         })
         .detach();
 
+        // Search input changes run global search over the scan index.
+        cx.subscribe_in(&search_input, window, |this, _input, event, _window, cx| {
+            if let InputEvent::Change = event {
+                let text = this.search_input.read(cx).value().to_string();
+                this.run_search(text, cx);
+            }
+        })
+        .detach();
+
         // Keep light/dark in sync with the system while we run.
         window
             .observe_window_appearance(|window, cx| {
@@ -1000,8 +1009,14 @@ impl AppShell {
         let task = smol::unblock(move || SearchIndex::build(&model.read()));
         cx.spawn(async move |this, cx| {
             let index = task.await;
-            this.update(cx, |shell, _| {
+            this.update(cx, |shell, cx| {
                 shell.search_index = Some(Arc::new(index));
+                let current_input = shell.search_input.read(cx).value().to_string();
+                if !current_input.is_empty() {
+                    shell.run_search(current_input, cx);
+                } else {
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -1046,6 +1061,8 @@ impl AppShell {
         self.search_generation += 1;
         let generation = self.search_generation;
         let Some(index) = self.search_index.clone() else {
+            self.search_results.clear();
+            cx.notify();
             return;
         };
         let task = smol::unblock(move || index.find(&query));
@@ -1070,6 +1087,11 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.search_results.clear();
+        self.search_query_active.clear();
+        self.search_generation += 1;
+        self.search_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         let parent = self.model.as_ref().and_then(|m| m.read().node(node).parent);
         if let Some(parent) = parent {
             self.navigate_to(parent, cx);
