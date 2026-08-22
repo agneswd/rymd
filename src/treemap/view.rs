@@ -260,7 +260,7 @@ impl Element for TreemapElement {
             });
 
         // Hover tracking: the shell owns the hovered node so the next
-        // frame repaints with the new highlight.
+        // frame repaints with the new highlight and follows the cursor.
         let rects_hover = state.rects.clone();
         let current_hover = self.hovered;
         let shell_for_hover = self.shell.clone();
@@ -277,6 +277,10 @@ impl Element for TreemapElement {
             if hit_node != current_hover {
                 let _ = shell_for_hover.update(cx, |shell, cx| {
                     shell.treemap_hovered = hit_node;
+                    cx.notify();
+                });
+            } else if hit_node.is_some() {
+                let _ = shell_for_hover.update(cx, |_shell, cx| {
                     cx.notify();
                 });
             }
@@ -482,8 +486,7 @@ impl Element for TreemapElement {
                         }
                     }
 
-                    // Tooltip while hovering, docked top-right. The path is
-                    // read from the model only now: lazily, at display time.
+                    // Tooltip while hovering, positioned near the mouse cursor.
                     if let Some(hover_node) = self.hovered
                         && let Some(r) = state.rects.iter().find(|r| r.node_id == hover_node)
                     {
@@ -522,7 +525,13 @@ impl Element for TreemapElement {
                             lines.push(("Mount point: not scanned".into(), muted));
                         }
                         lines.push((path.into(), muted));
-                        paint_tooltip(window, cx, bounds, popover, border_col, &font, &lines);
+                        let mouse_pos = window.mouse_position();
+                        let style = TooltipStyle {
+                            bg: popover,
+                            border: border_col,
+                            font: &font,
+                        };
+                        paint_tooltip(window, cx, bounds, mouse_pos, style, &lines);
                     }
                 });
             },
@@ -533,6 +542,12 @@ impl Element for TreemapElement {
             window.with_element_state(global_id, |_: Option<TreemapState>, _| ((), state));
         }
     }
+}
+
+struct TooltipStyle<'a> {
+    bg: gpui::Hsla,
+    border: gpui::Hsla,
+    font: &'a gpui::Font,
 }
 
 fn hit_test(rects: &[TreemapRect], pos: gpui::Point<Pixels>) -> Option<usize> {
@@ -547,46 +562,89 @@ fn paint_tooltip(
     window: &mut Window,
     cx: &mut App,
     container: Bounds<Pixels>,
-    bg: gpui::Hsla,
-    border: gpui::Hsla,
-    font: &gpui::Font,
+    mouse_pos: gpui::Point<Pixels>,
+    style: TooltipStyle,
     lines: &[(SharedString, gpui::Hsla)],
 ) {
     let pad = px(8.0);
     let line_h = px(16.0);
-    let max_w = px(420.0);
-    let width = max_w.min(container.size.width * 0.7);
+    let shaped_lines: Vec<_> = lines
+        .iter()
+        .map(|(text, color)| {
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: style.font.clone(),
+                color: *color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(text.clone(), px(12.0), &[run], None)
+        })
+        .collect();
+
+    let max_text_w = shaped_lines
+        .iter()
+        .map(|l| l.width)
+        .fold(px(0.0), |a, b| a.max(b));
+    let content_w = max_text_w + pad * 2.0;
+    let max_w = px(420.0).min((container.size.width - px(16.0)).max(px(100.0)));
+    let width = content_w.min(max_w).max(px(120.0));
     let height = line_h * lines.len() as f32 + pad * 2.0;
-    let origin = point(
-        container.origin.x + container.size.width - width - px(6.0),
-        container.origin.y + px(6.0),
+
+    let offset_x = px(12.0);
+    let offset_y = px(16.0);
+    let mut origin_x = mouse_pos.x + offset_x;
+    let mut origin_y = mouse_pos.y + offset_y;
+
+    let max_x = container.origin.x + container.size.width - width - px(6.0);
+    if origin_x > max_x {
+        let left_x = mouse_pos.x - width - px(12.0);
+        if left_x >= container.origin.x + px(6.0) {
+            origin_x = left_x;
+        } else {
+            origin_x = max_x;
+        }
+    }
+
+    let max_y = container.origin.y + container.size.height - height - px(6.0);
+    if origin_y > max_y {
+        let top_y = mouse_pos.y - height - px(12.0);
+        if top_y >= container.origin.y + px(6.0) {
+            origin_y = top_y;
+        } else {
+            origin_y = max_y;
+        }
+    }
+
+    origin_x = origin_x.clamp(
+        container.origin.x + px(6.0),
+        (container.origin.x + container.size.width - width - px(6.0))
+            .max(container.origin.x + px(6.0)),
     );
+    origin_y = origin_y.clamp(
+        container.origin.y + px(6.0),
+        (container.origin.y + container.size.height - height - px(6.0))
+            .max(container.origin.y + px(6.0)),
+    );
+
     let card = Bounds {
-        origin,
+        origin: point(origin_x, origin_y),
         size: Size::new(width, height),
     };
     window.paint_quad(gpui::quad(
         card,
         Corners::all(px(4.0)),
-        bg,
+        style.bg,
         Edges::all(px(1.0)),
-        border,
+        style.border,
         gpui::BorderStyle::Solid,
     ));
-    let mut y = origin.y + pad;
-    for (text, color) in lines {
-        let run = gpui::TextRun {
-            len: text.len(),
-            font: font.clone(),
-            color: *color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let shaped = window
-            .text_system()
-            .shape_line(text.clone(), px(12.0), &[run], None);
-        let _ = shaped.paint(point(origin.x + pad, y), line_h, window, cx);
+    let mut y = origin_y + pad;
+    for shaped in shaped_lines {
+        let _ = shaped.paint(point(origin_x + pad, y), line_h, window, cx);
         y += line_h;
     }
 }

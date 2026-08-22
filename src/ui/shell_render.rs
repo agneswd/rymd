@@ -38,7 +38,7 @@ impl AppShell {
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(gpui::svg().path("rymd.svg").size(px(16.)))
+                .child(gpui::img("icon.png").size(px(16.)))
                 .child(
                     div()
                         .text_sm()
