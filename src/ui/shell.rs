@@ -556,6 +556,8 @@ impl AppShell {
             dialog
                 .title("Move duplicates to Trash?")
                 .confirm()
+                .close_button(true)
+                .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Move to Trash")
@@ -569,7 +571,7 @@ impl AppShell {
                         let _ = w.update(cx, |shell, cx| {
                             shell.batch_remove_duplicates(targets.clone(), false, cx)
                         });
-                        false
+                        true
                     }
                 })
         });
@@ -592,7 +594,9 @@ impl AppShell {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Delete duplicates permanently?")
-                .alert()
+                .confirm()
+                .close_button(true)
+                .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete permanently")
@@ -607,7 +611,7 @@ impl AppShell {
                         let _ = w.update(cx, |shell, cx| {
                             shell.batch_remove_duplicates(targets.clone(), true, cx)
                         });
-                        false
+                        true
                     }
                 })
         });
@@ -730,6 +734,8 @@ impl AppShell {
             dialog
                 .title("Move to Trash?")
                 .confirm()
+                .close_button(true)
+                .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Move to Trash")
@@ -740,7 +746,7 @@ impl AppShell {
                     let w = weak.clone();
                     move |_, _, cx| {
                         let _ = w.update(cx, |shell, cx| shell.trash_node(node, cx));
-                        false
+                        true
                     }
                 })
         });
@@ -814,7 +820,9 @@ impl AppShell {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Delete permanently?")
-                .alert()
+                .confirm()
+                .close_button(true)
+                .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete permanently")
@@ -826,7 +834,7 @@ impl AppShell {
                     let w = weak.clone();
                     move |_, _, cx| {
                         let _ = w.update(cx, |shell, cx| shell.delete_permanently(node, cx));
-                        false
+                        true
                     }
                 })
         });
@@ -858,7 +866,9 @@ impl AppShell {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title(format!("Clear {name}?"))
-                .alert()
+                .confirm()
+                .close_button(true)
+                .overlay_closable(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Clear contents")
@@ -870,7 +880,7 @@ impl AppShell {
                     let w = weak.clone();
                     move |_, _, cx| {
                         let _ = w.update(cx, |shell, cx| shell.clear_contents(node, cx));
-                        false
+                        true
                     }
                 })
         });
