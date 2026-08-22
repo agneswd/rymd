@@ -776,10 +776,10 @@ impl AppShell {
     /// Cached against `view_version`; render calls reuse the last build.
     fn treemap_inputs(&mut self) -> (Vec<TreemapItem>, u64, Option<u32>) {
         let selected = self.state.selected_node.map(|n| n.0);
-        if let Some((version, dir_total, items)) = &self.treemap_cache {
-            if *version == self.view_version {
-                return (items.clone(), *dir_total, selected);
-            }
+        if let Some((version, dir_total, items)) = &self.treemap_cache
+            && *version == self.view_version
+        {
+            return (items.clone(), *dir_total, selected);
         }
 
         let mut items: Vec<TreemapItem> = Vec::new();
