@@ -292,6 +292,21 @@ fn volume_serial_of(handle: HANDLE) -> u64 {
     }
 }
 
+/// Identity of a path for delete-safety checks: (volume serial, file
+/// index, link count). Used by `actions::fs_ops` on Windows where
+/// directory-entry metadata cannot provide stable ids.
+pub fn identity_of(path: &Path) -> io::Result<(u64, u64, u64)> {
+    file_identity(path)
+}
+
+/// Whether `path` is currently a directory (lstat semantics: reparse
+/// points do not count).
+pub fn is_dir_no_follow(path: &Path) -> io::Result<bool> {
+    let md = std::fs::symlink_metadata(path)?;
+    Ok(md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+        && md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+}
+
 /// Open a handle with attribute access only, then read identity fields.
 fn file_identity(path: &Path) -> io::Result<(u64, u64, u64)> {
     let wide = to_wide(path);

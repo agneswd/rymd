@@ -809,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn hard_links_count_storage_once() {
         let td = TempDir::new("hardlink");
         let root = td.path();
@@ -857,6 +858,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn hard_links_across_directories_reconcile() {
         // Links spread over sibling directories exercise cross-chunk
         // reconciliation instead of the same-directory case.
@@ -898,6 +900,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn sparse_file_allocated_below_logical() {
         let td = TempDir::new("sparse");
         let root = td.path();
