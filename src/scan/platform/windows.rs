@@ -114,11 +114,7 @@ impl ScannerBackend for WindowsFilesystem {
 
 /// `.` and `..` in UTF-16 code units.
 fn is_dot_entry(units: &[u16]) -> bool {
-    match units {
-        [0x2E] => true,
-        [0x2E, 0x2E] => true,
-        _ => false,
-    }
+    units == [0x2E] || units == [0x2E, 0x2E]
 }
 
 fn kind_of_attributes(attrs: u32) -> EntryKind {
