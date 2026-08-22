@@ -3,12 +3,12 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, px, App, Context, IntoElement, ParentElement as _, Styled as _, WeakEntity, Window,
+    App, Context, IntoElement, ParentElement as _, Styled as _, WeakEntity, Window, div, px,
 };
 use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::PopupMenu;
 use gpui_component::table::{Column, TableDelegate, TableState};
-use gpui_component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
 
 use crate::duplicates::DuplicateFile;
 use crate::model::NodeId;

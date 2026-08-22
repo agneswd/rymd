@@ -30,7 +30,9 @@ pub fn partial_hash(path: &Path, len: u64) -> io::Result<u64> {
 
     // Fold the 256-bit digest into a stable 64-bit key.
     let hash = h.finalize();
-    Ok(u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap()))
+    Ok(u64::from_le_bytes(
+        hash.as_bytes()[0..8].try_into().unwrap(),
+    ))
 }
 
 /// Full content hash, streamed in chunks so huge files never balloon memory.

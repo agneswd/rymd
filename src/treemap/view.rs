@@ -8,19 +8,19 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, point, px, AnyElement, App, Bounds, Element, ElementId, GlobalElementId,
-    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Size,
-    Stateful, StatefulInteractiveElement as _, Styled, WeakEntity, Window,
+    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Size, Stateful,
+    StatefulInteractiveElement as _, Styled, WeakEntity, Window, div, point, px,
 };
-use gpui_component::{tooltip::Tooltip, ActiveTheme as _};
+use gpui_component::{ActiveTheme as _, tooltip::Tooltip};
 use parking_lot::RwLock;
 
-use crate::model::{NodeId, ScanModel, HARDLINK_SHARED, MOUNT_BOUNDARY};
+use crate::model::{HARDLINK_SHARED, MOUNT_BOUNDARY, NodeId, ScanModel};
 use crate::scan::options::SizeMetric;
 use crate::ui::shell::AppShell;
 use crate::util::format_size::{format_count, format_percent, format_size};
 
-use super::layout::{squarify, FRect, TreemapItem, TreemapRect};
+use super::layout::{FRect, TreemapItem, TreemapRect, squarify};
 
 /// Rectangles under this many pixels on a side are not drawn.
 const MIN_VISIBLE: f32 = 3.0;

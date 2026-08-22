@@ -7,7 +7,7 @@
 pub mod fs_ops;
 
 use crate::model::NodeId;
-use gpui::{actions, Action};
+use gpui::{Action, actions};
 
 actions!(
     rymd,

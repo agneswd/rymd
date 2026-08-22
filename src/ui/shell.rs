@@ -11,20 +11,16 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyWindowHandle, AppContext as _, Context, Entity, FocusHandle,
-    InteractiveElement as _,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    Window,
+    AnyWindowHandle, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
+    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::table::{TableEvent, TableState};
-use gpui_component::{
-    button::ButtonVariant,
-    dialog::DialogButtonProps,
-    notification::NotificationType,
-    ActiveTheme as _, Root, WindowExt as _,
-};
 use gpui_component::v_flex;
+use gpui_component::{
+    ActiveTheme as _, Root, WindowExt as _, button::ButtonVariant, dialog::DialogButtonProps,
+    notification::NotificationType,
+};
 use parking_lot::RwLock;
 
 use crate::actions::*;
@@ -32,10 +28,10 @@ use crate::model::{NodeId, ScanModel};
 use crate::scan::options::{ScanOptions, SizeMetric};
 use crate::scan::progress::ScanProgress;
 use crate::scan::scanner::{CancelHandle, ScanLive, ScanOutcome};
-use crate::state::{AppTab, AppState, ScanState};
-use crate::update::{SessionDismissals, UpdateState};
+use crate::state::{AppState, AppTab, ScanState};
 use crate::ui::duplicate_table::DuplicatesDelegate;
 use crate::ui::file_table::FileTableDelegate;
+use crate::update::{SessionDismissals, UpdateState};
 use crate::util::format_size::{format_count, format_size};
 
 pub struct AppShell {
@@ -79,16 +75,18 @@ impl AppShell {
                 .row_selectable(true)
         });
         let dup_delegate = DuplicatesDelegate::new();
-        let dup_table = cx.new(|cx| {
-            TableState::new(dup_delegate, window, cx).col_resizable(true)
-        });
+        let dup_table = cx.new(|cx| TableState::new(dup_delegate, window, cx).col_resizable(true));
 
         // Table events drive selection and navigation.
-        cx.subscribe_in(&table, window, |this, _table, event, window, cx| match event {
-            TableEvent::SelectRow(row) => this.on_table_select(*row, cx),
-            TableEvent::DoubleClickedRow(row) => this.on_table_activate(*row, window, cx),
-            _ => {}
-        })
+        cx.subscribe_in(
+            &table,
+            window,
+            |this, _table, event, window, cx| match event {
+                TableEvent::SelectRow(row) => this.on_table_select(*row, cx),
+                TableEvent::DoubleClickedRow(row) => this.on_table_activate(*row, window, cx),
+                _ => {}
+            },
+        )
         .detach();
 
         // Filter input changes re-filter the current directory.
@@ -97,7 +95,8 @@ impl AppShell {
                 let text = this.filter_input.read(cx).value().to_string();
                 this.state.filter = text.clone();
                 this.view_version += 1;
-                this.table.update(cx, |t, _| t.delegate_mut().set_filter(text));
+                this.table
+                    .update(cx, |t, _| t.delegate_mut().set_filter(text));
                 cx.notify();
             }
         })
@@ -157,31 +156,33 @@ impl AppShell {
             rx: job.rx,
         });
 
-        cx.spawn(async move |this, cx| loop {
-            smol::Timer::after(Duration::from_millis(100)).await;
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(Duration::from_millis(100)).await;
 
-            let finished = this
-                .update(cx, |shell, cx| {
-                    let Some(job) = &shell.scan_job else {
-                        return true;
-                    };
-                    shell.progress = job.live.progress();
-                    match job.rx.try_recv() {
-                        Ok(outcome) => {
-                            shell.finish_scan(outcome, cx);
-                            true
+                let finished = this
+                    .update(cx, |shell, cx| {
+                        let Some(job) = &shell.scan_job else {
+                            return true;
+                        };
+                        shell.progress = job.live.progress();
+                        match job.rx.try_recv() {
+                            Ok(outcome) => {
+                                shell.finish_scan(outcome, cx);
+                                true
+                            }
+                            Err(TryRecvError::Empty) => {
+                                cx.notify();
+                                false
+                            }
+                            Err(TryRecvError::Disconnected) => true,
                         }
-                        Err(TryRecvError::Empty) => {
-                            cx.notify();
-                            false
-                        }
-                        Err(TryRecvError::Disconnected) => true,
-                    }
-                })
-                .unwrap_or(true);
+                    })
+                    .unwrap_or(true);
 
-            if finished {
-                return;
+                if finished {
+                    return;
+                }
             }
         })
         .detach();
@@ -195,7 +196,10 @@ impl AppShell {
             ScanOutcome::Failed { path, error } => {
                 self.state.scan = ScanState::Failed { path, error };
             }
-            ScanOutcome::Completed { model, cancelled: _ } => {
+            ScanOutcome::Completed {
+                model,
+                cancelled: _,
+            } => {
                 self.state.filesystem = Some(crate::state::FilesystemStats {
                     free_bytes: model.free_space,
                 });
@@ -260,7 +264,8 @@ impl AppShell {
     fn set_current_dir(&mut self, node: NodeId, cx: &mut Context<Self>) {
         self.state.current_node = Some(node);
         self.view_version += 1;
-        self.table.update(cx, |t, _| t.delegate_mut().set_directory(node));
+        self.table
+            .update(cx, |t, _| t.delegate_mut().set_directory(node));
         cx.notify();
     }
 
@@ -444,7 +449,9 @@ impl AppShell {
 
     /// (node ids, bytes) of ticked files that still exist in groups.
     pub(crate) fn dup_selection(&self, cx: &Context<Self>) -> (Vec<NodeId>, u64) {
-        let Some(ds) = &self.state.duplicates else { return (Vec::new(), 0) };
+        let Some(ds) = &self.state.duplicates else {
+            return (Vec::new(), 0);
+        };
         let selected = self.dup_table.read(cx).delegate().selected();
         let mut nodes = Vec::new();
         let mut bytes = 0u64;
@@ -460,9 +467,13 @@ impl AppShell {
     }
 
     fn collect_dup_targets(&self, cx: &Context<Self>) -> Vec<DupTarget> {
-        let Some(model) = &self.model else { return Vec::new() };
+        let Some(model) = &self.model else {
+            return Vec::new();
+        };
         let m = model.read();
-        let Some(ds) = &self.state.duplicates else { return Vec::new() };
+        let Some(ds) = &self.state.duplicates else {
+            return Vec::new();
+        };
         let selected = self.dup_table.read(cx).delegate().selected();
         let mut out = Vec::new();
         for g in &ds.groups {
@@ -476,6 +487,8 @@ impl AppShell {
                         use std::os::unix::fs::MetadataExt;
                         (md.dev(), md.ino())
                     };
+                    #[cfg(not(unix))]
+                    let _ = &md;
                     #[cfg(not(unix))]
                     let (dev, ino) = (0u64, 0u64);
                     out.push(DupTarget {
@@ -520,8 +533,9 @@ impl AppShell {
                     let w = weak.clone();
                     let targets = targets.clone();
                     move |_, _, cx| {
-                        let _ =
-                            w.update(cx, |shell, cx| shell.batch_remove_duplicates(targets.clone(), false, cx));
+                        let _ = w.update(cx, |shell, cx| {
+                            shell.batch_remove_duplicates(targets.clone(), false, cx)
+                        });
                         false
                     }
                 })
@@ -557,8 +571,9 @@ impl AppShell {
                     let w = weak.clone();
                     let targets = targets.clone();
                     move |_, _, cx| {
-                        let _ =
-                            w.update(cx, |shell, cx| shell.batch_remove_duplicates(targets.clone(), true, cx));
+                        let _ = w.update(cx, |shell, cx| {
+                            shell.batch_remove_duplicates(targets.clone(), true, cx)
+                        });
                         false
                     }
                 })
@@ -609,8 +624,14 @@ impl AppShell {
                     shell.apply_deletion_and_refresh(t.node, cx);
                 }
                 shell.invalidate_duplicates();
-                shell.dup_table.update(cx, |t, _| t.delegate_mut().clear_selection());
-                let verb = if permanent { "deleted" } else { "moved to Trash" };
+                shell
+                    .dup_table
+                    .update(cx, |t, _| t.delegate_mut().clear_selection());
+                let verb = if permanent {
+                    "deleted"
+                } else {
+                    "moved to Trash"
+                };
                 let msg = if failures.is_empty() {
                     format!("{removed_count} items {verb}")
                 } else {
@@ -700,7 +721,11 @@ impl AppShell {
         }
         let path = model.read().path_of(node);
         if crate::actions::fs_ops::is_protected(&model.read().root_path, &path) {
-            self.notify(NotificationType::Error, "The scan root cannot be deleted.", cx);
+            self.notify(
+                NotificationType::Error,
+                "The scan root cannot be deleted.",
+                cx,
+            );
             return;
         }
 
@@ -822,7 +847,11 @@ impl AppShell {
         let Some(model) = &self.model else { return };
         let path = model.read().path_of(node);
         if crate::actions::fs_ops::is_protected(&model.read().root_path, &path) {
-            self.notify(NotificationType::Error, "The scan root cannot be deleted.", cx);
+            self.notify(
+                NotificationType::Error,
+                "The scan root cannot be deleted.",
+                cx,
+            );
             return;
         }
         let kind = model.read().node(node).kind();
@@ -883,7 +912,8 @@ impl AppShell {
                 m.apply_deletion(child);
             }
         }
-        self.table.update(cx, |t, _| t.delegate_mut().rebuild_rows());
+        self.table
+            .update(cx, |t, _| t.delegate_mut().rebuild_rows());
         cx.notify();
     }
 
@@ -906,7 +936,8 @@ impl AppShell {
         self.state.selected_node = None;
         self.view_version += 1;
         self.invalidate_duplicates();
-        self.table.update(cx, |t, _| t.delegate_mut().rebuild_rows());
+        self.table
+            .update(cx, |t, _| t.delegate_mut().rebuild_rows());
         cx.notify();
     }
 
@@ -937,7 +968,8 @@ impl AppShell {
         if self.state.metric != metric {
             self.state.metric = metric;
             self.view_version += 1;
-            self.table.update(cx, |t, _| t.delegate_mut().set_metric(metric));
+            self.table
+                .update(cx, |t, _| t.delegate_mut().set_metric(metric));
             cx.notify();
         }
     }
@@ -953,14 +985,16 @@ impl AppShell {
     }
 
     pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter_input.update(cx, |input, cx| input.focus(window, cx));
+        self.filter_input
+            .update(cx, |input, cx| input.focus(window, cx));
     }
 
     pub fn clear_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.selected_node = None;
         if !self.state.filter.is_empty() {
             self.state.filter.clear();
-            self.table.update(cx, |t, _| t.delegate_mut().set_filter(String::new()));
+            self.table
+                .update(cx, |t, _| t.delegate_mut().set_filter(String::new()));
             self.filter_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -1051,13 +1085,23 @@ impl AppShell {
         }
     }
 
-    fn on_trash_selected(&mut self, _: &TrashSelected, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_trash_selected(
+        &mut self,
+        _: &TrashSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(n) = self.selected_node() {
             self.confirm_trash(n, window, cx);
         }
     }
 
-    fn on_delete_selected(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_selected(
+        &mut self,
+        _: &DeleteSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(n) = self.selected_node() {
             self.confirm_delete(n, window, cx);
         }
@@ -1109,7 +1153,12 @@ impl AppShell {
         self.confirm_clear_dir(a.0, window, cx);
     }
 
-    fn on_metric_disk_usage(&mut self, _: &MetricDiskUsage, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_metric_disk_usage(
+        &mut self,
+        _: &MetricDiskUsage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.set_metric(SizeMetric::DiskUsage, cx);
     }
 
