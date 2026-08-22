@@ -196,8 +196,10 @@ impl WindowsFilesystem {
                         name_units.clear();
                         name_units.extend(
                             units
-                                .chunks_exact(2)
-                                .map(|c| u16::from_le_bytes([c[0], c[1]])),
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|c| u16::from_le_bytes(*c)),
                         );
                         blob_parts.push(std::mem::take(&mut name_units));
                         meta.push(Some(record_to_md(&r, volume_serial)));

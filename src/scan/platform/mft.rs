@@ -508,8 +508,10 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
                 let start = info.name_offset;
                 let end = start + info.name_units as usize * 2;
                 found = body.get(start..end).map(|raw| {
-                    raw.chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
                         .collect()
                 });
                 break;
