@@ -44,8 +44,22 @@ jobs:
             libxcb1-dev libxcb-cursor-dev libvulkan-dev libudev-dev \
             cmake clang build-essential
 
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --all-targets
+
+      - name: Benchmark harness builds
+        if: runner.os == 'Linux'
+        run: cargo build --release --bin rymd-bench
+
+      - name: Windows cross-check of the scanner
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --bins --lib --target x86_64-pc-windows-gnu
