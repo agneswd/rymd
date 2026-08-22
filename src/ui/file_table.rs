@@ -156,19 +156,19 @@ impl FileTableDelegate {
                 }
             }
             COL_SIZE | COL_PERCENT => {
-                rows.sort_by(|a, b| b.size.cmp(&a.size));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.size));
                 if asc {
                     rows.reverse();
                 }
             }
             COL_ITEMS => {
-                rows.sort_by(|a, b| b.items.cmp(&a.items));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.items));
                 if asc {
                     rows.reverse();
                 }
             }
             COL_MODIFIED => {
-                rows.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.modified_ms));
                 if asc {
                     rows.reverse();
                 }
@@ -204,9 +204,7 @@ fn memmem_like(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 impl Default for FileTableDelegate {
@@ -292,10 +290,10 @@ impl TableDelegate for FileTableDelegate {
                 .child(format_percent(row.size, self.dir_total))
                 .into_any_element(),
             COL_ITEMS => {
-                if row.kind == NodeKind::Directory && row.items > 0 {
+                if row.kind == NodeKind::Directory {
                     div()
                         .text_right()
-                        .child(format_count(row.items - if false {1} else {0}))
+                        .child(format_count(row.items))
                         .into_any_element()
                 } else {
                     div()
