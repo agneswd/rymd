@@ -355,3 +355,28 @@ fn to_wide(p: &Path) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_bulk_enumeration_scans_temp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_file.bin");
+        std::fs::write(&file_path, vec![0xAB; 8192]).unwrap();
+        let sub_dir = dir.path().join("sub_dir");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let sub_file = sub_dir.join("sub.txt");
+        std::fs::write(&sub_file, b"hello").unwrap();
+
+        let fs = WindowsFilesystem;
+        let batch = fs.enumerate(dir.path(), usize::MAX).unwrap();
+        assert!(batch.names.len() >= 2);
+        let names: Vec<String> = (0..batch.names.len())
+            .map(|i| batch.names.name_os(i).to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "test_file.bin"));
+        assert!(names.iter().any(|n| n == "sub_dir"));
+    }
+}

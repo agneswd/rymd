@@ -39,7 +39,7 @@ pub enum MftError {
     MalformedAttribute,
 }
 
-const RECORD_HEADER_LEN: usize = 0x30;
+const RECORD_HEADER_MIN_LEN: usize = 0x18;
 const ATTR_HEADER_RESIDENT_LEN: usize = 0x18;
 
 pub const ATTR_TYPE_STANDARD_INFORMATION: u32 = 0x10;
@@ -47,32 +47,47 @@ pub const ATTR_TYPE_FILE_NAME: u32 = 0x30;
 pub const ATTR_TYPE_DATA: u32 = 0x80;
 pub const ATTR_TYPE_INDEX_ROOT: u32 = 0x90;
 
-/// Record flags (`u16` at offset 0x38).
+/// Record flags (`u16` at offset 0x16 in a FILE record header).
 pub const RECORD_FLAG_IN_USE: u16 = 0x0001;
 pub const RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 
 /// Apply the multi-sector header (update sequence array / fixups) in place.
 ///
+/// In a standard NTFS `MULTI_SECTOR_HEADER`:
+/// - 0x00..0x04: signature ("FILE")
+/// - 0x04..0x06: UpdateSequenceArrayOffset (USA offset)
+/// - 0x06..0x08: UpdateSequenceArraySize (USA count in 2-byte units)
+///
 /// Every 512-byte sector's trailing two bytes were replaced with a check
-/// value when the record hit disk; the originals live in the array right
-/// after the USN. Returns `FixupMismatch` if any sector tail disagrees,
-/// which is the classic signature of a torn or corrupted record.
+/// value (USN) when written to disk; the original bytes live in the USA
+/// array immediately following the USN. Returns `FixupMismatch` if any
+/// sector tail disagrees.
 pub fn apply_fixups(record: &mut [u8]) -> Result<(), MftError> {
-    if record.len() < RECORD_HEADER_LEN {
+    if record.len() < RECORD_HEADER_MIN_LEN {
         return Err(MftError::OutOfBounds);
     }
-    let usa_offset = u16_at(record, 0x30) as usize;
-    let usa_count = u16_at(record, 0x32) as usize;
-    // One USN (2 bytes) plus (count - 1) fixup pairs.
-    if usa_count == 0 || usa_offset + usa_count * 2 > record.len() {
+    let usa_offset = u16_at(record, 0x04) as usize;
+    let usa_count = u16_at(record, 0x06) as usize;
+    if usa_count == 0 {
         return Err(MftError::OutOfBounds);
     }
-    let usn = [record[usa_offset], record[usa_offset + 1]];
+    let usa_bytes = usa_count.checked_mul(2).ok_or(MftError::OutOfBounds)?;
+    if usa_offset
+        .checked_add(usa_bytes)
+        .is_none_or(|end| end > record.len())
+    {
+        return Err(MftError::OutOfBounds);
+    }
     let sector = 512usize;
     if !record.len().is_multiple_of(sector) {
         return Err(MftError::OutOfBounds);
     }
-    for i in 1..usa_count {
+    let sectors = record.len() / sector;
+    if usa_count < 1 + sectors {
+        return Err(MftError::OutOfBounds);
+    }
+    let usn = [record[usa_offset], record[usa_offset + 1]];
+    for i in 1..=sectors {
         let val_off = usa_offset + i * 2;
         // The fixup belongs at the end of the i-th 512-byte sector.
         let tail = i * sector - 2;
@@ -90,16 +105,20 @@ pub fn apply_fixups(record: &mut [u8]) -> Result<(), MftError> {
 
 /// Whether the record header claims this entry is present and valid.
 pub fn record_in_use(record: &[u8]) -> bool {
-    record.len() >= 0x3A && flags_of(record) & RECORD_FLAG_IN_USE != 0
+    record.len() >= RECORD_HEADER_MIN_LEN && flags_of(record) & RECORD_FLAG_IN_USE != 0
 }
 
 /// Whether the record describes a directory (from the header flags).
 pub fn record_is_directory(record: &[u8]) -> bool {
-    record.len() >= 0x3A && flags_of(record) & RECORD_FLAG_DIRECTORY != 0
+    record.len() >= RECORD_HEADER_MIN_LEN && flags_of(record) & RECORD_FLAG_DIRECTORY != 0
 }
 
-fn flags_of(record: &[u8]) -> u16 {
-    u16_at(record, 0x38)
+pub fn flags_of(record: &[u8]) -> u16 {
+    if record.len() >= RECORD_HEADER_MIN_LEN {
+        u16_at(record, 0x16)
+    } else {
+        0
+    }
 }
 
 /// Iterate raw attribute records inside an MFT record.
@@ -107,14 +126,14 @@ fn flags_of(record: &[u8]) -> u16 {
 /// Yields subslices; malformed lengths terminate the iteration instead of
 /// panicking or running past the buffer.
 pub fn attributes(record: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let start = if record.len() >= 0x20 {
+    let start = if record.len() >= RECORD_HEADER_MIN_LEN {
         u16_at(record, 0x14) as usize
     } else {
         0
     };
     let mut off = start;
     std::iter::from_fn(move || {
-        if off + 0x10 > record.len() {
+        if off < RECORD_HEADER_MIN_LEN || off + 8 > record.len() {
             return None;
         }
         let attr_type = u32_at(record, off);
@@ -129,6 +148,32 @@ pub fn attributes(record: &[u8]) -> impl Iterator<Item = &[u8]> {
         off += len;
         Some(attr)
     })
+}
+
+/// Extract the value slice from a resident attribute record.
+///
+/// Verifies that the attribute is resident (byte 0x08 == 0) and uses the
+/// recorded `ValueOffset` (0x14) and `ValueLength` (0x10) fields to return
+/// the exact value slice without assuming a hardcoded start offset.
+pub fn resident_value(attr: &[u8]) -> Result<&[u8], MftError> {
+    if attr.len() < ATTR_HEADER_RESIDENT_LEN {
+        return Err(MftError::OutOfBounds);
+    }
+    if attr[8] != 0 {
+        return Err(MftError::MalformedAttribute);
+    }
+    let val_len = u32_at(attr, 0x10) as usize;
+    let val_off = u16_at(attr, 0x14) as usize;
+    let end = val_off.checked_add(val_len).ok_or(MftError::OutOfBounds)?;
+    if end > attr.len() {
+        return Err(MftError::OutOfBounds);
+    }
+    Ok(&attr[val_off..end])
+}
+
+/// Whether an attribute is the unnamed default stream (name length at 0x09 is 0).
+pub fn attribute_is_unnamed(attr: &[u8]) -> bool {
+    attr.len() >= 0x0A && attr[9] == 0
 }
 
 /// A `$FILE_NAME` attribute body.
@@ -146,8 +191,7 @@ pub struct FileNameInfo {
     pub namespace: u8,
 }
 
-/// Parse a `$FILE_NAME` attribute body (the bytes after the resident
-/// attribute header).
+/// Parse a `$FILE_NAME` attribute body (the bytes of the resident value).
 pub fn parse_file_name(body: &[u8]) -> Result<FileNameInfo, MftError> {
     // Fixed part: parent(8) creation(8) modification(8) mft_mod(8)
     // access(8) allocated(8) real(8) flags(4) reparse_tag(4)
@@ -194,14 +238,10 @@ pub fn parse_data_attr(attr: &[u8]) -> Result<DataInfo, MftError> {
     }
     let non_resident = attr[8] != 0;
     if !non_resident {
-        // Resident: value_len @0x10, value_off @0x14.
-        if attr.len() < 0x16 {
-            return Err(MftError::OutOfBounds);
-        }
-        let value_len = u32_at(attr, 0x10) as u64;
+        let val = resident_value(attr)?;
         Ok(DataInfo {
             resident: true,
-            real_size: value_len,
+            real_size: val.len() as u64,
             allocated_size: 0,
             runs_offset: 0,
             runs_len: 0,
@@ -448,34 +488,31 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
     for attr in attributes(record) {
         match u32_at(attr, 0) {
             ATTR_TYPE_STANDARD_INFORMATION => {
-                // Body starts after the resident header (0x10); the
-                // modification time sits at body offset 0x08.
-                if attr.len() >= 0x10 + 0x10 {
-                    let ft = i64_at(attr, 0x10 + 0x08);
+                if let Ok(body) = resident_value(attr)
+                    && body.len() >= 0x10
+                {
+                    let ft = i64_at(body, 0x08);
                     modified_ms = filetime_to_unix_ms(ft);
                 }
             }
             ATTR_TYPE_FILE_NAME => {
-                // Skip resident-header bytes to reach the attribute body.
-                let Some(body) = attr.get(0x10..) else {
-                    return Err(MftError::OutOfBounds);
-                };
-                let info = parse_file_name(body)?;
-                link_count += 1;
-                let better = match (best_name.as_ref().map(|n| n.namespace), info.namespace) {
-                    (_, 3) | (_, 1) => true,
-                    // DOS aliases and POSIX names lose against any Win32 name.
-                    (Some(1) | Some(3), _) => false,
-                    _ => true,
-                };
-                if better || best_name.is_none() {
-                    best_name = Some(info);
+                if let Ok(body) = resident_value(attr) {
+                    let info = parse_file_name(body)?;
+                    link_count += 1;
+                    let better = match (best_name.as_ref().map(|n| n.namespace), info.namespace) {
+                        (_, 3) | (_, 1) => true,
+                        // DOS aliases and POSIX names lose against any Win32 name.
+                        (Some(1) | Some(3), _) => false,
+                        _ => true,
+                    };
+                    if better || best_name.is_none() {
+                        best_name = Some(info);
+                    }
                 }
             }
             ATTR_TYPE_DATA => {
                 // Only the unnamed stream is the file's content.
-                let has_name = attr[6] != 0;
-                if !has_name && data.is_none() {
+                if attribute_is_unnamed(attr) && data.is_none() {
                     data = Some(parse_data_attr(attr)?);
                 }
             }
@@ -496,15 +533,15 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
         // few attributes) so we borrow from `record`, not a stale slice.
         let mut found: Option<Vec<u16>> = None;
         for attr in attributes(record) {
-            if u32_at(attr, 0) != ATTR_TYPE_FILE_NAME || attr.len() < 0x10 {
+            if u32_at(attr, 0) != ATTR_TYPE_FILE_NAME {
                 continue;
             }
-            if let Ok(info) = parse_file_name(&attr[0x10..])
+            if let Ok(body) = resident_value(attr)
+                && let Ok(info) = parse_file_name(body)
                 && info.name_units == name_info.name_units
                 && info.namespace == name_info.namespace
                 && info.parent_record == name_info.parent_record
             {
-                let body = &attr[0x10..];
                 let start = info.name_offset;
                 let end = start + info.name_units as usize * 2;
                 found = body.get(start..end).map(|raw| {
@@ -669,6 +706,15 @@ pub fn consume_record(record_no: u64, record: &mut [u8], entries: &mut Vec<Entry
 }
 
 /// Create a synthetic 1024-byte MFT record for testing and benchmarks.
+///
+/// Follows standard Microsoft NTFS on-disk layouts:
+/// - 0x00..0x04: "FILE"
+/// - 0x04..0x06: UpdateSequenceArrayOffset = 0x30
+/// - 0x06..0x08: UpdateSequenceArraySize = 3 (1 USN + 2 sector fixup entries)
+/// - 0x14..0x16: FirstAttributeOffset = 0x38
+/// - 0x16..0x18: Flags (IN_USE | DIRECTORY)
+/// - 0x30..0x36: USA array
+/// - 0x38..: Attributes ($STANDARD_INFORMATION, $FILE_NAME, $DATA)
 pub fn create_synthetic_record(
     _record_no: u64,
     parent_record: u64,
@@ -679,29 +725,30 @@ pub fn create_synthetic_record(
 ) -> Vec<u8> {
     let mut rec = vec![0u8; 1024];
     rec[0..4].copy_from_slice(b"FILE");
-    rec[0x14] = 0x40;
-    rec[0x15] = 0x00;
+    // USA offset at 0x04: 0x30, USA count at 0x06: 3
+    rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+    rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+    // First attribute offset at 0x14: 0x38
+    rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+    // Flags at 0x16
     let flags: u16 = RECORD_FLAG_IN_USE | if is_dir { RECORD_FLAG_DIRECTORY } else { 0 };
     rec[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
-    rec[0x38..0x3A].copy_from_slice(&flags.to_le_bytes());
 
-    // USA pointer at 0x30..0x34: usa_offset = 0x28, usa_count = 3
-    rec[0x30] = 0x28;
-    rec[0x31] = 0x00;
-    rec[0x32] = 0x03;
-    rec[0x33] = 0x00;
-
-    let mut off = 0x40usize;
+    let mut off = 0x38usize;
 
     // Attr 1: $STANDARD_INFORMATION (0x10)
-    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+    let std_val_len = 0x30u32;
+    let std_val_off = 0x18u16;
     let std_len = 0x48u32;
+    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
     rec[off + 4..off + 8].copy_from_slice(&std_len.to_le_bytes());
     rec[off + 8] = 0; // resident
-    rec[off + 0x10..off + 0x14].copy_from_slice(&0x30u32.to_le_bytes());
-    rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+    rec[off + 9] = 0; // unnamed
+    rec[off + 0x10..off + 0x14].copy_from_slice(&std_val_len.to_le_bytes());
+    rec[off + 0x14..off + 0x16].copy_from_slice(&std_val_off.to_le_bytes());
+    let std_val_start = off + std_val_off as usize;
     let mtime: i64 = 133500000000000000;
-    rec[off + 0x20..off + 0x28].copy_from_slice(&mtime.to_le_bytes());
+    rec[std_val_start + 0x08..std_val_start + 0x10].copy_from_slice(&mtime.to_le_bytes());
     off += std_len as usize;
 
     // Attr 2: $FILE_NAME (0x30)
@@ -709,13 +756,15 @@ pub fn create_synthetic_record(
     let name_units = name_utf16.len() as u8;
     let name_bytes = name_units as usize * 2;
     let body_len = 66 + name_bytes;
+    let fn_val_off = 0x18u16;
     let fn_attr_len = (0x18 + body_len).next_multiple_of(8);
     rec[off..off + 4].copy_from_slice(&ATTR_TYPE_FILE_NAME.to_le_bytes());
     rec[off + 4..off + 8].copy_from_slice(&(fn_attr_len as u32).to_le_bytes());
-    rec[off + 8] = 0;
+    rec[off + 8] = 0; // resident
+    rec[off + 9] = 0; // unnamed
     rec[off + 0x10..off + 0x14].copy_from_slice(&(body_len as u32).to_le_bytes());
-    rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
-    let fn_body = off + 0x18;
+    rec[off + 0x14..off + 0x16].copy_from_slice(&fn_val_off.to_le_bytes());
+    let fn_body = off + fn_val_off as usize;
     let parent_ref: u64 = parent_record | (1u64 << 48);
     rec[fn_body..fn_body + 8].copy_from_slice(&parent_ref.to_le_bytes());
     rec[fn_body + 64] = name_units;
@@ -731,7 +780,8 @@ pub fn create_synthetic_record(
             let data_attr_len = (0x18 + real_size as usize).next_multiple_of(8).max(0x20);
             rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
             rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
-            rec[off + 8] = 0;
+            rec[off + 8] = 0; // resident
+            rec[off + 9] = 0; // unnamed
             rec[off + 0x10..off + 0x14].copy_from_slice(&(real_size as u32).to_le_bytes());
             rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
             off += data_attr_len;
@@ -743,7 +793,8 @@ pub fn create_synthetic_record(
                 .max(0x48);
             rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
             rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
-            rec[off + 8] = 1;
+            rec[off + 8] = 1; // non-resident
+            rec[off + 9] = 0; // unnamed
             rec[off + 0x20..off + 0x22].copy_from_slice(&runs_off.to_le_bytes());
             rec[off + 0x28..off + 0x30].copy_from_slice(&allocated_size.to_le_bytes());
             rec[off + 0x30..off + 0x38].copy_from_slice(&real_size.to_le_bytes());
@@ -758,12 +809,13 @@ pub fn create_synthetic_record(
         rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     }
 
-    rec[0x28] = 0x42;
-    rec[0x29] = 0x42;
-    rec[0x2A] = rec[510];
-    rec[0x2B] = rec[511];
-    rec[0x2C] = rec[1022];
-    rec[0x2D] = rec[1023];
+    // USA array at 0x30..0x36: USN [0x42, 0x42]
+    rec[0x30] = 0x42;
+    rec[0x31] = 0x42;
+    rec[0x32] = rec[510];
+    rec[0x33] = rec[511];
+    rec[0x34] = rec[1022];
+    rec[0x35] = rec[1023];
 
     rec[510] = 0x42;
     rec[511] = 0x42;
@@ -784,11 +836,9 @@ mod tests {
         // Two-sector record with one fixup pair.
         let mut rec = vec![0u8; 1024];
         rec[0..4].copy_from_slice(b"FILE");
-        // USA at 0x30, count 3 => USN + 2 pairs.
-        rec[0x30] = 0x28;
-        rec[0x31] = 0x00;
-        rec[0x32] = 0x03;
-        rec[0x33] = 0x00;
+        // USA pointer at 0x04 (offset 0x28), USA count at 0x06 (count 3 => USN + 2 sectors).
+        rec[0x04..0x06].copy_from_slice(&0x28u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
         // USN value 0xABCD.
         rec[0x28] = 0xCD;
         rec[0x29] = 0xAB;
@@ -815,12 +865,316 @@ mod tests {
     }
 
     #[test]
+    fn usa_offsets_and_flags_at_spec_locations_not_legacy_offsets() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        // Real USA header fields at 0x04 and 0x06
+        rec[0x04..0x06].copy_from_slice(&0x28u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        // Real flags at 0x16
+        rec[0x16..0x18]
+            .copy_from_slice(&(RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).to_le_bytes());
+
+        // Bogus values at wrong legacy locations (0x30/0x32/0x38)
+        rec[0x30..0x32].copy_from_slice(&0xDEADu16.to_le_bytes());
+        rec[0x32..0x34].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&0xCAFEu16.to_le_bytes());
+
+        // Set up USN at real USA location (0x28)
+        rec[0x28] = 0x42;
+        rec[0x29] = 0x42;
+        rec[0x2A] = 0x11;
+        rec[0x2B] = 0x22;
+        rec[0x2C] = 0x33;
+        rec[0x2D] = 0x44;
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        assert!(apply_fixups(&mut rec).is_ok());
+        assert!(record_in_use(&rec));
+        assert!(record_is_directory(&rec));
+    }
+
+    #[test]
+    fn flags_only_read_from_0x16() {
+        let mut rec = vec![0u8; 512];
+        // Flags at 0x16 is 0, bogus flag at 0x38 is IN_USE
+        rec[0x16..0x18].copy_from_slice(&0u16.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+        assert!(!record_in_use(&rec));
+
+        // Now set real flags at 0x16
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&0u16.to_le_bytes());
+        assert!(record_in_use(&rec));
+        assert!(!record_is_directory(&rec));
+
+        rec[0x16..0x18]
+            .copy_from_slice(&(RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).to_le_bytes());
+        assert!(record_is_directory(&rec));
+    }
+
+    #[test]
+    fn resident_value_offset_resolution() {
+        // Standard attribute with ValueOffset = 0x18
+        let mut attr_std = vec![0u8; 0x28];
+        attr_std[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr_std[4..8].copy_from_slice(&0x28u32.to_le_bytes());
+        attr_std[8] = 0; // resident
+        attr_std[0x10..0x14].copy_from_slice(&10u32.to_le_bytes()); // ValueLength = 10
+        attr_std[0x14..0x16].copy_from_slice(&0x18u16.to_le_bytes()); // ValueOffset = 0x18
+        attr_std[0x18..0x22].copy_from_slice(b"0123456789");
+        let val = resident_value(&attr_std).unwrap();
+        assert_eq!(val, b"0123456789");
+
+        // Custom attribute with non-default ValueOffset = 0x20
+        let mut attr_custom = vec![0u8; 0x30];
+        attr_custom[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr_custom[4..8].copy_from_slice(&0x30u32.to_le_bytes());
+        attr_custom[8] = 0; // resident
+        attr_custom[0x10..0x14].copy_from_slice(&8u32.to_le_bytes()); // ValueLength = 8
+        attr_custom[0x14..0x16].copy_from_slice(&0x20u16.to_le_bytes()); // ValueOffset = 0x20
+        attr_custom[0x20..0x28].copy_from_slice(b"abcdefgh");
+        let val = resident_value(&attr_custom).unwrap();
+        assert_eq!(val, b"abcdefgh");
+
+        // Out-of-bounds ValueOffset
+        let mut bad_off = attr_std.clone();
+        bad_off[0x14..0x16].copy_from_slice(&0x50u16.to_le_bytes());
+        assert_eq!(resident_value(&bad_off).unwrap_err(), MftError::OutOfBounds);
+
+        // Out-of-bounds ValueLength
+        let mut bad_len = attr_std.clone();
+        bad_len[0x10..0x14].copy_from_slice(&500u32.to_le_bytes());
+        assert_eq!(resident_value(&bad_len).unwrap_err(), MftError::OutOfBounds);
+
+        // Non-resident attribute passed to resident_value
+        let mut non_res = attr_std.clone();
+        non_res[8] = 1;
+        assert_eq!(
+            resident_value(&non_res).unwrap_err(),
+            MftError::MalformedAttribute
+        );
+    }
+
+    #[test]
+    fn standard_information_timestamp_from_value_offset() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+
+        // Attr 1: $STANDARD_INFORMATION with non-default ValueOffset = 0x20
+        let mut off = 0x38usize;
+        let std_val_len = 0x30u32;
+        let std_val_off = 0x20u16;
+        let std_len = 0x50u32;
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&std_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 0x10..off + 0x14].copy_from_slice(&std_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&std_val_off.to_le_bytes());
+        let mtime: i64 = 133500000000000000;
+        let std_val_start = off + std_val_off as usize;
+        rec[std_val_start + 0x08..std_val_start + 0x10].copy_from_slice(&mtime.to_le_bytes());
+        off += std_len as usize;
+
+        // Attr 2: $FILE_NAME
+        let fn_attr = {
+            let fn_rec = create_synthetic_record(16, 5, "test.txt", false, 100, 4096);
+            attributes(&fn_rec).nth(1).unwrap().to_vec()
+        };
+        rec[off..off + fn_attr.len()].copy_from_slice(&fn_attr);
+        off += fn_attr.len();
+
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Set up USN fixups
+        rec[0x30] = 0x42;
+        rec[0x31] = 0x42;
+        rec[0x32] = rec[510];
+        rec[0x33] = rec[511];
+        rec[0x34] = rec[1022];
+        rec[0x35] = rec[1023];
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.modified_ms, filetime_to_unix_ms(mtime));
+    }
+
+    #[test]
+    fn named_alternate_data_stream_ignored() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+
+        let mut off = 0x38usize;
+
+        // $STANDARD_INFORMATION
+        let std_attr = attributes(&create_synthetic_record(16, 5, "a", false, 0, 0))
+            .next()
+            .unwrap()
+            .to_vec();
+        rec[off..off + std_attr.len()].copy_from_slice(&std_attr);
+        off += std_attr.len();
+
+        // $FILE_NAME
+        let fn_attr = attributes(&create_synthetic_record(16, 5, "file.txt", false, 0, 0))
+            .nth(1)
+            .unwrap()
+            .to_vec();
+        rec[off..off + fn_attr.len()].copy_from_slice(&fn_attr);
+        off += fn_attr.len();
+
+        // Named $DATA stream (ADS $DATA:Zone.Identifier)
+        let ads_val_len = 20u32;
+        let ads_len = (0x18 + ads_val_len).next_multiple_of(8);
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&ads_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 9] = 4; // name_length = 4 (named stream!)
+        rec[off + 0x10..off + 0x14].copy_from_slice(&ads_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += ads_len as usize;
+
+        // Unnamed primary $DATA stream
+        let primary_val_len = 50u32;
+        let primary_len = (0x18 + primary_val_len).next_multiple_of(8);
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&primary_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 9] = 0; // name_length = 0 (unnamed stream!)
+        rec[off + 0x10..off + 0x14].copy_from_slice(&primary_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += primary_len as usize;
+
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Fixups
+        rec[0x30] = 0x42;
+        rec[0x31] = 0x42;
+        rec[0x32] = rec[510];
+        rec[0x33] = rec[511];
+        rec[0x34] = rec[1022];
+        rec[0x35] = rec[1023];
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.logical, 50);
+    }
+
+    #[test]
+    fn realistic_file_record_fixture() {
+        // Byte fixture representing a spec-correct NTFS FILE record for "notes.txt":
+        // - Magic "FILE"
+        // - USA offset at 0x04 = 0x30, USA count at 0x06 = 3
+        // - First attribute offset at 0x14 = 0x38
+        // - Flags at 0x16 = 0x0001 (IN_USE)
+        // - Attributes: $STANDARD_INFORMATION at 0x38, $FILE_NAME at 0x80, $DATA at 0xFA
+        let mut fixture = vec![0u8; 1024];
+        fixture[0x00..0x04].copy_from_slice(b"FILE");
+        fixture[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        fixture[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        fixture[0x08..0x10].copy_from_slice(&0x12345678u64.to_le_bytes()); // LSN
+        fixture[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // Seq
+        fixture[0x12..0x14].copy_from_slice(&1u16.to_le_bytes()); // HardLinkCount
+        fixture[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes()); // FirstAttr
+        fixture[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes()); // Flags
+
+        // USA at 0x30..0x36
+        fixture[0x30..0x32].copy_from_slice(&[0x99, 0x88]); // USN
+        fixture[0x32..0x34].copy_from_slice(&[0x11, 0x22]); // Sector 1 tail
+        fixture[0x34..0x36].copy_from_slice(&[0x33, 0x44]); // Sector 2 tail
+
+        // Attr 1: $STANDARD_INFORMATION at 0x38 (len 0x48)
+        let mut off = 0x38usize;
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&0x48u32.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&0x30u32.to_le_bytes()); // ValueLength
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes()); // ValueOffset
+        let mtime: i64 = 133500000000000000;
+        fixture[off + 0x18 + 0x08..off + 0x18 + 0x10].copy_from_slice(&mtime.to_le_bytes());
+        off += 0x48;
+
+        // Attr 2: $FILE_NAME at 0x80 (len 0x78)
+        let name = "notes.txt";
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        let body_len = (66 + name_u16.len() * 2) as u32;
+        let fn_attr_len = (0x18 + body_len).next_multiple_of(8);
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_FILE_NAME.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&fn_attr_len.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&body_len.to_le_bytes());
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        let val_start = off + 0x18;
+        let parent_ref = 5u64 | (1u64 << 48); // parent 5, seq 1
+        fixture[val_start..val_start + 8].copy_from_slice(&parent_ref.to_le_bytes());
+        fixture[val_start + 64] = name_u16.len() as u8;
+        fixture[val_start + 65] = 1; // Win32
+        for (i, u) in name_u16.iter().enumerate() {
+            fixture[val_start + 66 + i * 2..val_start + 68 + i * 2]
+                .copy_from_slice(&u.to_le_bytes());
+        }
+        off += fn_attr_len as usize;
+
+        // Attr 3: $DATA at off (len 0x28, resident content b"Hello, World!")
+        let content = b"Hello, World!";
+        let data_len = (0x18 + content.len()).next_multiple_of(8) as u32;
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&data_len.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&(content.len() as u32).to_le_bytes());
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        fixture[off + 0x18..off + 0x18 + content.len()].copy_from_slice(content);
+        off += data_len as usize;
+
+        // End marker
+        fixture[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Sector tails with USN check values
+        fixture[510] = 0x99;
+        fixture[511] = 0x88;
+        fixture[1022] = 0x99;
+        fixture[1023] = 0x88;
+
+        let entry = extract_entry(42, &mut fixture).unwrap();
+        assert_eq!(entry.record_no, 42);
+        assert_eq!(entry.parent_record, Some(5));
+        assert_eq!(String::from_utf16_lossy(&entry.name_units), "notes.txt");
+        assert!(!entry.is_directory);
+        assert_eq!(entry.logical, 13);
+        assert_eq!(entry.allocated, 0);
+        assert_eq!(entry.modified_ms, filetime_to_unix_ms(mtime));
+
+        // Verify fixup restored the original sector tail bytes
+        assert_eq!(fixture[510..512], [0x11, 0x22]);
+        assert_eq!(fixture[1022..1024], [0x33, 0x44]);
+    }
+
+    #[test]
     fn truncated_fixup_array_is_out_of_bounds() {
         let mut rec = vec![0u8; 512];
-        rec[0x30] = 0xFF;
-        rec[0x31] = 0xFF; // USA offset beyond record
-        rec[0x32] = 0x05;
-        rec[0x33] = 0x00;
+        rec[0x04] = 0xFF;
+        rec[0x05] = 0xFF; // USA offset beyond record
+        rec[0x06] = 0x05;
+        rec[0x07] = 0x00;
         assert_eq!(apply_fixups(&mut rec).unwrap_err(), MftError::OutOfBounds);
     }
 
@@ -931,9 +1285,12 @@ mod tests {
     #[test]
     fn data_attrs_report_real_and_allocated_sizes() {
         // Resident data of 100 bytes (allocated is 0 as data is in MFT record).
-        let mut attr = vec![0u8; 0x20];
+        let mut attr = vec![0u8; 0x20 + 100];
+        attr[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr[4..8].copy_from_slice(&((0x18 + 100) as u32).to_le_bytes());
         attr[8] = 0; // resident
-        attr[0x10] = 100;
+        attr[0x10..0x14].copy_from_slice(&100u32.to_le_bytes());
+        attr[0x14..0x16].copy_from_slice(&0x18u16.to_le_bytes());
         let d = parse_data_attr(&attr).unwrap();
         assert!(d.resident);
         assert_eq!(d.real_size, 100);

@@ -141,6 +141,7 @@ Implemented / CI validated in this pass:
 - Synthetic MFT streaming benchmarks on Linux (`rymd-bench --mft N`):
   - 100k records (97.7 MiB): **12.7 ms** (~7.88 million records/s, 7.7 GB/s)
   - 500k records (488.3 MiB): **57.3 ms** (~8.72 million records/s, 8.5 GB/s)
+  Synthetic parser throughput validates CPU-side streaming overhead only. Real NTFS MFT scan performance remains pending a real Windows benchmark.
   The old implementation repeatedly front-drained chunks, causing O(N^2)
   memory moves (~32 GB memmove per 8 MiB buffer). The new parser is O(N)
   streaming with zero per-record heap allocations.
