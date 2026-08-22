@@ -324,6 +324,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn name_blob_round_trips_raw_bytes() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;

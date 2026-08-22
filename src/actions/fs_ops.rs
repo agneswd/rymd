@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_delete_removes_link_not_target() {
         let td = TempDir::new("symdel");
         let target = td.0.join("target.txt");
