@@ -11,6 +11,9 @@ impl AssetSource for Assets {
             "rymd.svg" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
                 "../assets/rymd.svg"
             )))),
+            "rymd-titlebar.svg" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../assets/rymd-titlebar.svg"
+            )))),
             "icon.png" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
                 "../assets/icon.png"
             )))),
@@ -21,6 +24,7 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>, anyhow::Error> {
         let mut out = gpui_component_assets::Assets.list(path)?;
         out.push("rymd.svg".into());
+        out.push("rymd-titlebar.svg".into());
         out.push("icon.png".into());
         Ok(out)
     }

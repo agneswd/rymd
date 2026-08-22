@@ -259,6 +259,42 @@ impl Element for TreemapElement {
                 (handed_out, state)
             });
 
+        self.base.interactivity().prepaint(
+            Some(global_id),
+            inspector_id,
+            bounds,
+            bounds.size,
+            window,
+            cx,
+            |_style, _origin, _hitbox, _window, _cx| {},
+        );
+
+        Some(state)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(mut state) = prepaint.take() else {
+            self.base.interactivity().paint(
+                global_id,
+                inspector_id,
+                bounds,
+                None,
+                window,
+                cx,
+                |_, _, _| {},
+            );
+            return;
+        };
+
         // Hover tracking: the shell owns the hovered node so the next
         // frame repaints with the new highlight and follows the cursor.
         let rects_hover = state.rects.clone();
@@ -306,42 +342,6 @@ impl Element for TreemapElement {
                 }
             });
         });
-
-        self.base.interactivity().prepaint(
-            Some(global_id),
-            inspector_id,
-            bounds,
-            bounds.size,
-            window,
-            cx,
-            |_style, _origin, _hitbox, _window, _cx| {},
-        );
-
-        Some(state)
-    }
-
-    fn paint(
-        &mut self,
-        global_id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let Some(mut state) = prepaint.take() else {
-            self.base.interactivity().paint(
-                global_id,
-                inspector_id,
-                bounds,
-                None,
-                window,
-                cx,
-                |_, _, _| {},
-            );
-            return;
-        };
 
         // Paint inside the container's content mask.
         let theme = cx.theme();

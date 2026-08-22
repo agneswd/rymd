@@ -216,4 +216,26 @@ mod tests {
         assert!(memmem(b"abc", b""));
         assert!(!memmem(b"", b"a"));
     }
+
+    #[test]
+    fn query_normalization_and_zero_matches_behavior() {
+        let m = model_with_names(&["budget.xlsx", "notes.md", "README.txt"]);
+        let idx = SearchIndex::build(&m);
+
+        // Empty and whitespace queries
+        assert!(normalize_query("").is_empty());
+        assert_eq!(idx.find(&normalize_query("")), Vec::<NodeId>::new());
+
+        // Non-matching query returns 0 matches
+        let no_match = normalize_query("nonexistent");
+        assert!(!no_match.is_empty());
+        let results = idx.find(&no_match);
+        assert!(results.is_empty(), "query is active but matches 0 items");
+
+        // Refine with zero matching subset
+        let initial = idx.find(&normalize_query("note"));
+        assert_eq!(initial.len(), 1);
+        let refined_empty = idx.refine(&initial, &normalize_query("notexyz"));
+        assert!(refined_empty.is_empty());
+    }
 }
