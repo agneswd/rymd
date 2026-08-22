@@ -151,8 +151,14 @@ impl WindowsFilesystem {
         let mut meta: Vec<Option<FileMetadata>> = Vec::with_capacity(128);
         let mut blob_parts: Vec<Vec<u16>> = Vec::with_capacity(128);
         let mut name_units: Vec<u16> = Vec::new();
+        let debug = std::env::var_os("RYMD_SCAN_DEBUG").is_some();
+        let mut rounds = 0u32;
 
         loop {
+            rounds += 1;
+            if debug && rounds > 8 {
+                eprintln!("rymd: enumerate_bulk {dir:?} round {rounds}");
+            }
             // The call does not report how much it wrote, so the buffer is
             // zeroed each round and parsing walks until a zero offset or an
             // untouched tail.
@@ -180,6 +186,12 @@ impl WindowsFilesystem {
                         continue;
                     }
                     _ => {
+                        if debug {
+                            eprintln!(
+                                "rymd: enumerate_bulk {dir:?} stopping on error {}",
+                                err.raw_os_error().unwrap_or(-1)
+                            );
+                        }
                         // SAFETY: created above, closed exactly once.
                         unsafe { CloseHandle(handle) };
                         return Err(err);

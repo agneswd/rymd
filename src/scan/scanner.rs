@@ -356,7 +356,15 @@ fn failed_shared() -> Shared {
     }
 }
 
+fn scan_debug_enabled() -> bool {
+    std::env::var_os("RYMD_SCAN_DEBUG").is_some()
+}
+
 fn run_pool(shared: &Arc<Shared>, workers: usize) {
+    let debug = scan_debug_enabled();
+    if debug {
+        eprintln!("rymd: pool start with {workers} workers");
+    }
     // Workers exist before threads start so every stealer handle is known
     // up front (the standard crossbeam-deque pattern).
     let mut locals = Vec::with_capacity(workers);
@@ -379,6 +387,9 @@ fn run_pool(shared: &Arc<Shared>, workers: usize) {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_loop(&s, local, &stealers)
             }));
+            if debug {
+                eprintln!("rymd: worker exited (panic: {})", result.is_err());
+            }
             if let Err(panic) = result {
                 let msg = panic
                     .downcast_ref::<String>()
@@ -391,6 +402,9 @@ fn run_pool(shared: &Arc<Shared>, workers: usize) {
     }
     for j in joins {
         let _ = j.join();
+    }
+    if debug {
+        eprintln!("rymd: pool joined all workers");
     }
     // Every worker has exited. If jobs are still outstanding and this was
     // not a deliberate cancellation, something went wrong that must not
@@ -407,15 +421,45 @@ fn worker_loop(shared: &Arc<Shared>, local: Worker<Job>, stealers: &[Stealer<Job
     let fs = backend();
     let options = ScanOptions::default();
     let mut st = WorkerState::new();
+    let debug = scan_debug_enabled();
+    if debug {
+        eprintln!("rymd: worker enter {:?}", thread::current().id());
+    }
 
     loop {
         if shared.is_cancelled() {
+            if debug {
+                eprintln!("rymd: worker {:?} exit cancelled", thread::current().id());
+            }
             break;
         }
         if let Some(job) = shared.sched.find(&local, stealers) {
+            if debug {
+                match &job {
+                    Job::Dir(d) => {
+                        eprintln!("rymd: worker {:?} dir {:?}", thread::current().id(), d.path)
+                    }
+                    Job::Meta(m) => eprintln!(
+                        "rymd: worker {:?} meta {} names",
+                        thread::current().id(),
+                        m.names.len()
+                    ),
+                }
+            }
             process_job(shared, fs, job, &mut st, &options);
-            if shared.sched.complete() {
-                break; // nothing outstanding anywhere
+            let last = shared.sched.complete();
+            if debug {
+                eprintln!(
+                    "rymd: worker {:?} done job (outstanding {}, last {last})",
+                    thread::current().id(),
+                    shared.sched.outstanding()
+                );
+            }
+            if last {
+                if debug {
+                    eprintln!("rymd: worker {:?} exit last-job", thread::current().id());
+                }
+                break;
             }
             continue;
         }

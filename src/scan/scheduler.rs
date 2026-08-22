@@ -265,10 +265,14 @@ impl Scheduler {
     }
 
     /// Mark one job finished; true when this was the last outstanding one.
+    ///
+    /// Every completion wakes all registered idlers, not just the final
+    /// one: they either find the next job or observe quiet and exit. The
+    /// lock is uncontended while jobs are flowing, and this removes any
+    /// dependence on exact registration timing for liveness.
     pub fn complete(&self) -> bool {
         let last = self.pending.fetch_sub(1, Ordering::AcqRel) == 1;
-        if last {
-            // Wake everyone so blocked workers can exit promptly.
+        {
             let mut idle = self.idle.lock();
             for waiter in idle.drain(..) {
                 waiter.unpark();
