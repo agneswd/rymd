@@ -1,9 +1,15 @@
-//! Windows implementation of the platform filesystem layer.
+//! Windows implementation of the scanner backend.
 //!
 //! Identity comes from the volume serial number plus the NTFS file index,
-//! which is the Windows analogue of Linux `st_dev` + `st_ino`. Allocated
-//! size is rounded up to the NTFS cluster size, matching what Explorer
-//! reports as "size on disk".
+//! which is the Windows analogue of Linux `st_dev` + `st_ino`.
+//!
+//! The current implementation stats one entry at a time through
+//! `CreateFileW` + `GetFileInformationByHandle`, exactly like the original
+//! platform layer did. It is correct but syscall-heavy; the planned
+//! replacement enumerates whole directories with
+//! `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` so names,
+//! attributes, sizes, allocation sizes and link counts arrive from
+//! directory records without opening every file.
 
 use std::io;
 use std::os::windows::fs::MetadataExt;
@@ -16,13 +22,48 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
-use super::super::metadata::{EntryKind, FileMetadata, PlatformFilesystem};
+use super::super::metadata::{EntryBatch, EntryKind, FileMetadata, ScannerBackend};
+use super::super::scheduler::NameBlob;
 
-const CLUSTER: u64 = 4096;
+const CLUSTER_FALLBACK: u64 = 4096;
 
 pub struct WindowsFilesystem;
 
-impl PlatformFilesystem for WindowsFilesystem {
+impl ScannerBackend for WindowsFilesystem {
+    fn name(&self) -> &'static str {
+        "windows-per-file"
+    }
+
+    /// All metadata is gathered inline during enumeration, so no chunking.
+    fn inline_limit(&self) -> usize {
+        usize::MAX
+    }
+
+    fn enumerate(&self, dir: &Path, _inline_limit: usize) -> io::Result<EntryBatch> {
+        let rd = std::fs::read_dir(dir)?;
+        let mut blob_parts: Vec<Vec<u8>> = Vec::with_capacity(64);
+        let mut meta: Vec<Option<FileMetadata>> = Vec::new();
+        for entry in rd {
+            let entry = entry?;
+            let child = dir.join(entry.file_name());
+            meta.push(self.metadata(&child).ok());
+            blob_parts.push(entry.file_name().into_vec());
+        }
+        let names = NameBlob::from_flattened(blob_parts);
+        Ok(EntryBatch { names, meta })
+    }
+
+    fn stat_names(&self, dir: &Path, names: &NameBlob) -> Vec<Option<FileMetadata>> {
+        // Only reached if a caller spills despite inline_limit == MAX.
+        (0..names.len())
+            .map(|ix| {
+                let mut p = PathBuf::from(dir);
+                p.push(names.name_os(ix).as_ref());
+                self.metadata(&p).ok()
+            })
+            .collect()
+    }
+
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         // symlink_metadata never follows reparse points.
         let md = std::fs::symlink_metadata(path)?;
@@ -38,7 +79,7 @@ impl PlatformFilesystem for WindowsFilesystem {
 
         let logical = md.len();
         let allocated = match kind {
-            EntryKind::File => logical.div_ceil(CLUSTER) * CLUSTER,
+            EntryKind::File => logical.div_ceil(CLUSTER_FALLBACK) * CLUSTER_FALLBACK,
             _ => 0,
         };
         let (device, inode, nlink) = file_identity(path).unwrap_or((0, 0, 1));
@@ -52,11 +93,6 @@ impl PlatformFilesystem for WindowsFilesystem {
             inode,
             nlink,
         })
-    }
-
-    fn filesystem_id(&self, path: &Path) -> io::Result<u64> {
-        let (_, volume, _) = file_identity(path)?;
-        Ok(volume)
     }
 
     fn free_space(&self, path: &Path) -> io::Result<u64> {

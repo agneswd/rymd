@@ -13,6 +13,7 @@ anyhow = "1"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
 directories = "6"
 parking_lot = "0.12"
 rayon = "1"

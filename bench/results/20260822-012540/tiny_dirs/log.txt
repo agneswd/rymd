@@ -1,0 +1,20 @@
+Benchmark 1: ./target/release/rymd-bench '/home/elias/rymd-bench-trees/tiny_dirs'
+  Time (mean ± σ):     225.6 ms ±   4.9 ms    [User: 216.4 ms, System: 454.1 ms]
+  Range (min … max):   218.1 ms … 228.6 ms    7 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 1: '/tmp/opencode/gdu' -n -p -c '/home/elias/rymd-bench-trees/tiny_dirs' > /dev/null
+  Time (mean ± σ):     146.5 ms ±   4.2 ms    [User: 289.3 ms, System: 365.5 ms]
+  Range (min … max):   143.5 ms … 152.9 ms    7 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 1: '/tmp/opencode/gdu' -s -n -p -c '/home/elias/rymd-bench-trees/tiny_dirs' > /dev/null
+  Time (mean ± σ):     151.3 ms ±  11.6 ms    [User: 303.1 ms, System: 352.6 ms]
+  Range (min … max):   143.6 ms … 176.4 ms    7 runs
+ 
+Benchmark 1: '/home/elias/.cargo/bin/dua' aggregate '/home/elias/rymd-bench-trees/tiny_dirs' > /dev/null
+  Time (mean ± σ):     201.3 ms ±   3.7 ms    [User: 393.4 ms, System: 588.4 ms]
+  Range (min … max):   193.9 ms … 204.9 ms    7 runs
+ 

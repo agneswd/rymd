@@ -2,22 +2,10 @@ use std::path::PathBuf;
 
 use gpui::{px, size, AppContext as _, Application, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use gpui_component::Root;
-use assets::Assets;
-
-mod actions;
-mod assets;
-mod duplicates;
-
-mod model;
-mod scan;
-mod state;
-mod treemap;
-mod ui;
-mod update;
-mod util;
-
-use actions::*;
-use ui::shell::AppShell;
+use rymd::assets::Assets;
+use rymd::actions::*;
+use rymd::update;
+use rymd::ui::shell::AppShell;
 
 use gpui::actions;
 

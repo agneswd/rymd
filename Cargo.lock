@@ -5036,6 +5036,7 @@ dependencies = [
  "blake3",
  "chrono",
  "crossbeam-channel",
+ "crossbeam-deque",
  "directories",
  "gpui",
  "gpui-component",
