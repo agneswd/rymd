@@ -259,6 +259,11 @@ impl Scheduler {
         self.pending.load(Ordering::Acquire) == 0
     }
 
+    /// Jobs pushed but not yet completed.
+    pub fn outstanding(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+
     /// Mark one job finished; true when this was the last outstanding one.
     pub fn complete(&self) -> bool {
         let last = self.pending.fetch_sub(1, Ordering::AcqRel) == 1;
