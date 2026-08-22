@@ -150,6 +150,7 @@ jobs:
           AppPublisher=agneswd
           AppUpdatesURL=https://github.com/agneswd/rymd/releases
           DefaultDirName={autopf}\Rymd
+          SetupIconFile=assets\icon.ico
           UninstallDisplayIcon={app}\rymd.exe
           OutputBaseFilename=rymd-${{ env.RYMD_VERSION }}-windows-x86_64-setup
           OutputDir=.

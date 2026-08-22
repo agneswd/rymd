@@ -38,6 +38,9 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_IO",
 ] }
 
+[build-dependencies]
+winres = "0.1"
+
 [profile.dev]
 debug = "limited"
 

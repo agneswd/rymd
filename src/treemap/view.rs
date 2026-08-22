@@ -420,70 +420,81 @@ impl Element for TreemapElement {
                             continue;
                         }
                         let visual = &state.visuals[ix];
+                        let tile_bounds = Bounds {
+                            origin: bounds.origin + point(px(r.x), px(r.y)),
+                            size: Size::new(px((r.w - 1.0).max(1.0)), px((r.h - 1.0).max(1.0))),
+                        };
                         let tile_origin = bounds.origin + point(px(r.x), px(r.y));
-                        if show_full {
-                            let line = state.labels.entry(ix).or_insert_with(|| {
-                                let run = gpui::TextRun {
-                                    len: visual.name.len(),
-                                    font: font.clone(),
-                                    color: foreground,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                window.text_system().shape_line(
-                                    visual.name.clone(),
-                                    px(12.0),
-                                    &[run],
-                                    None,
-                                )
-                            });
-                            let origin = tile_origin + point(px(4.0), px(4.0));
-                            let _ = line.paint(origin, px(14.5), window, cx);
-                            if let Some(sub) = &visual.sublabel {
-                                let run = gpui::TextRun {
-                                    len: sub.len(),
-                                    font: font.clone(),
-                                    color: muted,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                let shaped = window.text_system().shape_line(
-                                    sub.clone(),
-                                    px(10.5),
-                                    &[run],
-                                    None,
-                                );
-                                let _ = shaped.paint(
-                                    tile_origin + point(px(4.0), px(19.0)),
-                                    px(13.0),
-                                    window,
-                                    cx,
-                                );
-                            }
-                        } else {
-                            let run = gpui::TextRun {
-                                len: visual.name.len(),
-                                font: font.clone(),
-                                color: foreground,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            let shaped = window.text_system().shape_line(
-                                visual.name.clone(),
-                                px(10.5),
-                                &[run],
-                                None,
-                            );
-                            let _ = shaped.paint(
-                                tile_origin + point(px(3.0), px(3.0)),
-                                px(12.0),
-                                window,
-                                cx,
-                            );
-                        }
+                        window.with_content_mask(
+                            Some(gpui::ContentMask {
+                                bounds: tile_bounds,
+                            }),
+                            |window| {
+                                if show_full {
+                                    let line = state.labels.entry(ix).or_insert_with(|| {
+                                        let run = gpui::TextRun {
+                                            len: visual.name.len(),
+                                            font: font.clone(),
+                                            color: foreground,
+                                            background_color: None,
+                                            underline: None,
+                                            strikethrough: None,
+                                        };
+                                        window.text_system().shape_line(
+                                            visual.name.clone(),
+                                            px(12.0),
+                                            &[run],
+                                            None,
+                                        )
+                                    });
+                                    let origin = tile_origin + point(px(4.0), px(4.0));
+                                    let _ = line.paint(origin, px(14.5), window, cx);
+                                    if let Some(sub) = &visual.sublabel {
+                                        let run = gpui::TextRun {
+                                            len: sub.len(),
+                                            font: font.clone(),
+                                            color: muted,
+                                            background_color: None,
+                                            underline: None,
+                                            strikethrough: None,
+                                        };
+                                        let shaped = window.text_system().shape_line(
+                                            sub.clone(),
+                                            px(10.5),
+                                            &[run],
+                                            None,
+                                        );
+                                        let _ = shaped.paint(
+                                            tile_origin + point(px(4.0), px(19.0)),
+                                            px(13.0),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                } else {
+                                    let run = gpui::TextRun {
+                                        len: visual.name.len(),
+                                        font: font.clone(),
+                                        color: foreground,
+                                        background_color: None,
+                                        underline: None,
+                                        strikethrough: None,
+                                    };
+                                    let shaped = window.text_system().shape_line(
+                                        visual.name.clone(),
+                                        px(10.5),
+                                        &[run],
+                                        None,
+                                    );
+                                    let _ = shaped.paint(
+                                        tile_origin + point(px(3.0), px(3.0)),
+                                        px(12.0),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        );
                     }
 
                     // Tooltip while hovering, positioned near the mouse cursor.
