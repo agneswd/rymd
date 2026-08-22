@@ -30,6 +30,8 @@ pub struct ScanModel {
     pub duration_ms: u64,
     /// Time spent in final aggregation (part of `duration_ms`).
     pub aggregate_ms: f64,
+    /// Which backend produced this model ("work-stealing", "ntfs-mft").
+    pub backend: &'static str,
     /// True when the scan stopped early because the user cancelled it.
     pub was_cancelled: bool,
 }
@@ -45,6 +47,7 @@ impl ScanModel {
             free_space: None,
             duration_ms: 0,
             aggregate_ms: 0.0,
+            backend: "",
             was_cancelled: false,
         }
     }
