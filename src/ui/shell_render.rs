@@ -40,7 +40,7 @@ impl AppShell {
                 .items_center()
                 .child(
                     gpui::svg()
-                        .path("rymd.svg")
+                        .path("rymd-titlebar.svg")
                         .text_color(theme.foreground)
                         .size(px(16.)),
                 )
