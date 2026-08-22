@@ -1,13 +1,13 @@
 //! The file list table, built on gpui-component's virtualized DataTable.
 
-use std::rc::Rc;
-
 use gpui::{
     App, Context, IntoElement, ParentElement as _, Styled as _, WeakEntity, Window, div, px,
 };
 use gpui_component::menu::PopupMenu;
 use gpui_component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -26,7 +26,7 @@ pub const COL_MODIFIED: usize = 4;
 /// Rows shown by the table for the current directory. The delegate keeps a
 /// materialized `Vec<NodeId>` so sorting and filtering never touch the model.
 pub struct FileTableDelegate {
-    pub model: Option<Rc<RwLock<ScanModel>>>,
+    pub model: Option<Arc<RwLock<ScanModel>>>,
     pub rows: Vec<NodeId>,
     pub dir: Option<NodeId>,
     pub dir_total: u64,

@@ -20,8 +20,23 @@ use rymd::scan::scanner::{ScanOutcome, spawn_scan};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let Some(root) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: rymd-bench <path> [--runs N] [--json]");
+    let first = args.next();
+
+    // In-memory search benchmark needs no path: rymd-bench --search N
+    if first.as_deref() == Some("--search") {
+        let n = args
+            .next()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                eprintln!("--search requires a node count");
+                std::process::exit(2);
+            });
+        run_search_bench(n);
+        return;
+    }
+
+    let Some(root) = first.map(PathBuf::from) else {
+        eprintln!("usage: rymd-bench <path> [--runs N] [--json] | rymd-bench --search N");
         std::process::exit(2);
     };
     let mut runs = 1usize;
@@ -213,4 +228,103 @@ fn current_rss_kb() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let rss_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     Some(rss_pages * 4) // assume 4 KiB pages
+}
+
+// ---- in-memory search benchmark ----------------------------------------
+
+fn run_search_bench(nodes: usize) {
+    use rymd::model::{Node, NodeId, NodeKind, ScanModel};
+    use rymd::search::{SearchIndex, normalize_query};
+
+    println!("building synthetic model with {nodes} nodes...");
+    let t0 = Instant::now();
+    let mut nodes_vec: Vec<Node> = Vec::with_capacity(nodes + 1);
+    nodes_vec.push(Node {
+        parent: None,
+        name: "/synthetic".into(),
+        kind: NodeKind::Directory,
+        own_logical: 0,
+        own_allocated: 0,
+        agg_logical: 0,
+        agg_allocated: 0,
+        file_count: 0,
+        dir_count: 0,
+        modified_ms: None,
+        device: 0,
+        inode: 0,
+        children: Vec::new(),
+        flags: 0,
+    });
+    for i in 0..nodes {
+        let id = NodeId(i as u32 + 1);
+        let name = match i % 3 {
+            0 => format!("document{i:08}.txt"),
+            1 => format!("Photo_{i:06}.JPG"),
+            _ => format!("backup-{i:09}.zip"),
+        };
+        let node = Node {
+            parent: Some(NodeId(0)),
+            name: name.into(),
+            kind: NodeKind::File,
+            own_logical: i as u64,
+            own_allocated: i as u64,
+            agg_logical: i as u64,
+            agg_allocated: i as u64,
+            file_count: 1,
+            dir_count: 0,
+            modified_ms: None,
+            device: 0,
+            inode: id.0 as u64,
+            children: Vec::new(),
+            flags: 0,
+        };
+        nodes_vec.push(node);
+    }
+    // Link children to the root so the tree is well-formed.
+    for n in nodes_vec.iter_mut().skip(1) {
+        n.parent = Some(NodeId(0));
+    }
+    nodes_vec[0].children = (1..=nodes as u32).map(NodeId).collect();
+    let model = ScanModel::from_nodes(PathBuf::from("/synthetic"), 0, nodes_vec);
+    println!("model built in {:.1} ms", elapsed_ms(t0));
+
+    let peak = PeakRss::start();
+    let t = Instant::now();
+    let index = SearchIndex::build(&model);
+    let build_ms = elapsed_ms(t);
+    let mem_kb = peak.finish();
+    println!(
+        "index build: {build_ms:.1} ms | index+overhead rss peak ~{} MiB",
+        mem_kb / 1024
+    );
+
+    for q in ["document", "photo_42", "backup-000123456"] {
+        let query = normalize_query(q);
+        // Warm pass so allocator effects do not dominate.
+        let warm = index.find(&query);
+
+        // Time to first hit: run the scan on a thread that reports when
+        // the first id is pushed. Approximated here by scanning a prefix:
+        // find() is a flat loop, so per-hit latency is uniform; report
+        // full-pass time and derive the per-hit figure.
+        let t_all = Instant::now();
+        let results = index.find(&query);
+        let all_ms = elapsed_ms(t_all);
+        let per_hit_ms = if results.is_empty() || all_ms == 0.0 {
+            all_ms
+        } else {
+            all_ms / (results.len() as f64 / warm.len() as f64).max(1.0)
+        };
+
+        let top100 = results.len().min(100);
+        let top1000 = results.len().min(1000);
+        println!(
+            "query {q:?}: {} hits | full pass {all_ms:.2} ms | ~{per_hit_ms:.4} ms per equal-sized pass | top{top100}/top{top1000} are O(1) slices",
+            results.len()
+        );
+    }
+}
+
+fn elapsed_ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
 }

@@ -2,7 +2,10 @@
 //! state logic stays readable.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{Context, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
+use gpui::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, div, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu};
@@ -117,7 +120,24 @@ impl AppShell {
         let filter_input = Input::new(&self.filter_input)
             .prefix(Icon::new(IconName::Search).small())
             .cleanable(true);
-        bar = bar.child(div().w(px(220.)).child(filter_input));
+        bar = bar.child(div().w(px(200.)).child(filter_input));
+
+        // Global search over the completed scan.
+        if self.search_index.is_some() {
+            let hits = self.search_results.len();
+            let mut search_field = Input::new(&self.search_input)
+                .prefix(Icon::new(IconName::Search).small())
+                .cleanable(true);
+            if hits > 0 {
+                search_field = search_field.suffix(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format_count(hits as u64)),
+                );
+            }
+            bar = bar.child(div().w(px(240.)).child(search_field));
+        }
 
         if scanning {
             bar = bar.child(Spinner::new().small());
@@ -356,7 +376,124 @@ impl AppShell {
             return self.render_empty_state(cx).into_any_element();
         }
 
+        // Search results replace the body while a query is active.
+        if !self.search_results.is_empty() {
+            return self.render_search_results(cx).into_any_element();
+        }
+
         self.render_files_split(cx).into_any_element()
+    }
+
+    /// Global search results. Paths are resolved only for rendered rows;
+    /// the list is capped so a million-hit query cannot stall paint.
+    fn render_search_results(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::px;
+        let theme = cx.theme();
+        let metric = self.state.metric;
+        let total = self.search_results.len();
+        const MAX_ROWS: usize = 500;
+
+        let shell = cx.entity().downgrade();
+        let rows: Vec<gpui::AnyElement> = self
+            .search_results
+            .iter()
+            .take(MAX_ROWS)
+            .filter_map(|&node| {
+                let m = self.model.as_ref()?;
+                let (name, size, is_dir) = {
+                    let m = m.read();
+                    let n = m.node(node);
+                    (
+                        n.name.to_string_lossy().into_owned(),
+                        metric.pick(n.agg_logical, n.agg_allocated),
+                        n.is_dir(),
+                    )
+                };
+                Some(
+                    div()
+                        .id(("search-row", node.0))
+                        .w_full()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(3.0))
+                                .hover(|s| s.bg(theme.accent.opacity(0.12)))
+                                .items_center()
+                                .child(
+                                    Icon::new(if is_dir {
+                                        IconName::Folder
+                                    } else {
+                                        IconName::File
+                                    })
+                                    .small()
+                                    .text_color(if is_dir {
+                                        theme.primary
+                                    } else {
+                                        theme.muted_foreground
+                                    }),
+                                )
+                                .child(div().max_w(px(320.)).truncate().child(name))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .truncate()
+                                        .child(self.search_result_path(node)),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_right()
+                                        .min_w(px(72.))
+                                        .text_color(theme.muted_foreground)
+                                        .child(format_size(size)),
+                                ),
+                        )
+                        .on_click({
+                            let shell = shell.clone();
+                            move |_, window, cx| {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.open_search_result(node, window, cx);
+                                });
+                            }
+                        })
+                        .into_any_element(),
+                )
+            })
+            .collect();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "{} matches{}",
+                        format_count(total as u64),
+                        if total > MAX_ROWS {
+                            " (showing first 500)"
+                        } else {
+                            ""
+                        }
+                    ))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(v_flex().gap_0().children(rows)),
+            )
     }
 
     fn render_empty_state(&self, cx: &Context<Self>) -> impl IntoElement {
