@@ -1,0 +1,18 @@
+Benchmark 1: ./target/release/rymd-bench '/home/elias/rymd-bench-trees/many_small'
+  Time (mean ± σ):      50.7 ms ±   4.8 ms    [User: 73.5 ms, System: 165.6 ms]
+  Range (min … max):    46.2 ms …  56.5 ms    7 runs
+ 
+Benchmark 1: '/tmp/opencode/gdu' -n -p -c '/home/elias/rymd-bench-trees/many_small' > /dev/null
+  Time (mean ± σ):      61.6 ms ±   1.0 ms    [User: 123.5 ms, System: 175.1 ms]
+  Range (min … max):    60.2 ms …  63.5 ms    7 runs
+ 
+Benchmark 1: '/tmp/opencode/gdu' -s -n -p -c '/home/elias/rymd-bench-trees/many_small' > /dev/null
+  Time (mean ± σ):      63.4 ms ±   3.6 ms    [User: 120.9 ms, System: 178.2 ms]
+  Range (min … max):    60.6 ms …  71.3 ms    7 runs
+ 
+Benchmark 1: '/home/elias/.cargo/bin/dua' aggregate '/home/elias/rymd-bench-trees/many_small' > /dev/null
+  Time (mean ± σ):      44.2 ms ±   0.8 ms    [User: 95.1 ms, System: 144.7 ms]
+  Range (min … max):    43.3 ms …  45.9 ms    7 runs
+ 
+  Warning: The first benchmarking run for this command was significantly slower than the rest (45.9 ms). This could be caused by (filesystem) caches that were not filled until after the first run. You are already using the '--warmup' option which helps to fill these caches before the actual benchmark. You can either try to increase the warmup count further or re-run this benchmark on a quiet system in case it was a random outlier. Alternatively, consider using the '--prepare' option to clear the caches before each timing run.
+ 

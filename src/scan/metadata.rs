@@ -5,6 +5,8 @@
 use std::io;
 use std::path::Path;
 
+use super::scheduler::{EntryBatch, NameBlob};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
     Directory,
@@ -31,22 +33,40 @@ pub struct FileMetadata {
     pub nlink: u64,
 }
 
-/// Identifies the filesystem containing a path (`st_dev` on Linux,
-/// volume serial number on Windows).
-#[allow(dead_code)]
-pub type FilesystemId = u64;
-
 /// Platform boundary for the scanner. All methods use lstat semantics:
 /// symlinks are described by their own metadata, never by their target.
 #[allow(dead_code)]
-pub trait PlatformFilesystem: Send + Sync {
+pub trait ScannerBackend: Send + Sync {
+    /// Human-readable name for diagnostics.
+    fn name(&self) -> &'static str;
+
+    /// How many entries of a freshly enumerated directory this backend
+    /// fills metadata for during enumeration itself. Entries beyond the
+    /// limit spill as parallel [`ScannerBackend::stat_names`] chunks.
+    /// `usize::MAX` means enumeration already carries full metadata
+    /// (bulk directory reads) and no chunking is needed.
+    fn inline_limit(&self) -> usize {
+        usize::MAX
+    }
+
+    /// List the entry names of `dir`. Names are raw OS strings; metadata is
+    /// attached up to `inline_limit()` entries.
+    fn enumerate(&self, dir: &Path, inline_limit: usize) -> io::Result<EntryBatch>;
+
+    /// Collect lstat metadata for every name in `names`, which came from a
+    /// single earlier enumeration of `dir`. Per-name failures become
+    /// `None` and count as scan errors.
+    fn stat_names(&self, dir: &Path, names: &NameBlob) -> Vec<Option<FileMetadata>>;
+
+    /// Full-path metadata with lstat semantics (used for the scan root).
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata>;
-    fn filesystem_id(&self, path: &Path) -> io::Result<FilesystemId>;
-    /// Free space in bytes on the filesystem that contains `path`.
+
+    /// Free bytes on the filesystem that contains `path`.
     fn free_space(&self, path: &Path) -> io::Result<u64>;
 }
 
-pub fn platform() -> &'static dyn PlatformFilesystem {
+/// The backend for the running platform.
+pub fn backend() -> &'static dyn ScannerBackend {
     #[cfg(target_os = "linux")]
     {
         &super::platform::linux::LinuxFilesystem

@@ -1,0 +1,18 @@
+Benchmark 1: ./target/release/rymd-bench '/home/elias/rymd-bench-trees/mixed'
+  Time (mean ± σ):      11.3 ms ±   0.1 ms    [User: 4.7 ms, System: 11.4 ms]
+  Range (min … max):    11.2 ms …  11.3 ms    7 runs
+ 
+Benchmark 1: '/tmp/opencode/gdu' -n -p -c '/home/elias/rymd-bench-trees/mixed' > /dev/null
+  Time (mean ± σ):       7.8 ms ±   0.5 ms    [User: 5.9 ms, System: 12.1 ms]
+  Range (min … max):     7.5 ms …   8.9 ms    7 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 1: '/tmp/opencode/gdu' -s -n -p -c '/home/elias/rymd-bench-trees/mixed' > /dev/null
+  Time (mean ± σ):       7.6 ms ±   0.1 ms    [User: 5.2 ms, System: 12.8 ms]
+  Range (min … max):     7.5 ms …   7.7 ms    7 runs
+ 
+Benchmark 1: '/home/elias/.cargo/bin/dua' aggregate '/home/elias/rymd-bench-trees/mixed' > /dev/null
+  Time (mean ± σ):       5.2 ms ±   0.2 ms    [User: 7.3 ms, System: 14.4 ms]
+  Range (min … max):     5.1 ms …   5.6 ms    7 runs
+ 

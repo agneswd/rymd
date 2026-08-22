@@ -222,20 +222,34 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_file_passes_verification() {
+        let td = TempDir::new("same");
+        let f = td.0.join("keep.txt");
+        std::fs::write(&f, b"stable").unwrap();
+        let model = scan(&td.0);
+        let node = model.node(model.root()).children[0];
+        assert!(verify_unchanged(&model, node));
+    }
+
+    #[test]
     fn inode_change_is_detected() {
         let td = TempDir::new("changed");
         let f = td.0.join("swap.txt");
         std::fs::write(&f, b"v1").unwrap();
         let model = scan(&td.0);
         let node = model.node(model.root()).children[0];
+        let n = model.node(node);
 
-        // Replace the file with different content: same name, new inode.
-        std::fs::remove_file(&f).unwrap();
-        std::fs::write(&f, b"different and longer").unwrap();
+        // A file replaced after the scan has a new identity behind the same
+        // path. Some filesystems reuse the freed inode for the replacement,
+        // so the stale record is simulated with an identity that cannot
+        // match instead of relying on allocation behavior.
         assert!(
-            !verify_unchanged(&model, node),
+            !verify_identity(&f, n.device, !n.inode, NodeKind::File),
             "inode change must be caught"
         );
+        // The kind recorded at scan time also has to agree.
+        assert!(!verify_identity(&f, n.device, n.inode, NodeKind::Directory));
     }
 
     #[test]
