@@ -24,7 +24,7 @@ use crate::model::NodeId;
 /// Entries per metadata chunk and the inline-statted prefix of a freshly
 /// enumerated directory. Large enough that chunk overhead is noise, small
 /// enough that a huge listing keeps every worker busy.
-pub const CHUNK: usize = 64;
+pub const CHUNK: usize = 128;
 
 /// Raw entry names from one directory, stored contiguously.
 ///
