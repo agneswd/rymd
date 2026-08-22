@@ -185,8 +185,10 @@ mod tests {
                 let r = rs[0];
                 assert_eq!(r.name_units, 9);
                 let name: Vec<u16> = rec[r.name_offset..r.name_offset + r.name_units * 2]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
                     .collect();
                 assert_eq!(String::from_utf16_lossy(&name), "hello.txt");
                 assert_eq!(r.end_of_file, 5000);
