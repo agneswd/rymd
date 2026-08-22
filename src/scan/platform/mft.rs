@@ -39,7 +39,6 @@ pub enum MftError {
     MalformedAttribute,
 }
 
-const MULTI_SECTOR_HEADER_LEN: usize = 8;
 const RECORD_HEADER_LEN: usize = 0x30;
 const ATTR_HEADER_RESIDENT_LEN: usize = 0x18;
 
@@ -758,7 +757,6 @@ mod tests {
 /// directory traversal.
 #[cfg(target_os = "windows")]
 pub mod reader {
-    use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
 
