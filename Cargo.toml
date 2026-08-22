@@ -48,5 +48,5 @@ taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
