@@ -23,11 +23,23 @@ pub const COL_PERCENT: usize = 2;
 pub const COL_ITEMS: usize = 3;
 pub const COL_MODIFIED: usize = 4;
 
-/// Rows shown by the table for the current directory. The delegate keeps a
-/// materialized `Vec<NodeId>` so sorting and filtering never touch the model.
+/// Lightweight per-row display data, rebuilt only when the directory,
+/// filter, sort or metric changes. Rendering reads exclusively from this,
+/// so ordinary scrolling never locks the model.
+pub struct RowView {
+    pub id: NodeId,
+    pub name: String,
+    pub kind: NodeKind,
+    pub flags: u16,
+    pub size: u64,
+    pub items: u64,
+    pub modified_ms: Option<i64>,
+}
+
+/// Rows shown by the table for the current directory.
 pub struct FileTableDelegate {
     pub model: Option<Arc<RwLock<ScanModel>>>,
-    pub rows: Vec<NodeId>,
+    pub rows: Vec<RowView>,
     pub dir: Option<NodeId>,
     pub dir_total: u64,
     pub metric: SizeMetric,
@@ -37,6 +49,20 @@ pub struct FileTableDelegate {
     pub columns: Vec<Column>,
     /// Handle back to the shell so context menus can run actions.
     pub shell: Option<WeakEntity<AppShell>>,
+}
+
+impl Default for RowView {
+    fn default() -> Self {
+        Self {
+            id: NodeId(0),
+            name: String::new(),
+            kind: NodeKind::File,
+            flags: 0,
+            size: 0,
+            items: 0,
+            modified_ms: None,
+        }
+    }
 }
 
 impl FileTableDelegate {
@@ -76,7 +102,10 @@ impl FileTableDelegate {
         }
     }
 
-    /// Rebuild rows from the model for `dir`, applying filter and current sort.
+    /// Rebuild rows from the model for `dir`, applying filter and current
+    /// sort. The model is read once; everything the renderer needs is
+    /// copied into [`RowView`] so painting never touches it again.
+    /// Point the table at `dir` and rebuild from the model.
     pub fn set_directory(&mut self, dir: NodeId) {
         self.dir = Some(dir);
         self.rebuild_rows();
@@ -86,54 +115,67 @@ impl FileTableDelegate {
         let Some(model) = &self.model else { return };
         let Some(dir) = self.dir else { return };
         let m = model.read();
+        let node = m.node(dir);
         self.dir_total = match self.metric {
-            SizeMetric::DiskUsage => m.node(dir).agg_allocated,
-            SizeMetric::Apparent => m.node(dir).agg_logical,
+            SizeMetric::DiskUsage => node.agg_allocated,
+            SizeMetric::Apparent => node.agg_logical,
         };
 
-        let filter = self.filter.to_lowercase();
-        let mut kids: Vec<NodeId> = m
-            .node(dir)
+        let filter = crate::search::normalize_query(&self.filter);
+        let metric = self.metric;
+        let mut rows: Vec<RowView> = node
             .children
             .iter()
-            .copied()
-            .filter(|&c| {
-                if filter.is_empty() {
-                    true
-                } else {
-                    m.node(c)
-                        .name
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&filter)
+            .map(|&c| {
+                let n = m.node(c);
+                RowView {
+                    id: c,
+                    name: n.name.to_string_lossy().into_owned(),
+                    kind: n.kind,
+                    flags: n.flags,
+                    size: metric.pick(n.agg_logical, n.agg_allocated),
+                    items: n.file_count + n.dir_count,
+                    modified_ms: n.modified_ms,
+                }
+            })
+            .filter(|row| {
+                filter.is_empty() || {
+                    let normalized = crate::search::normalize_query(&row.name);
+                    memmem_like(&normalized, &filter)
                 }
             })
             .collect();
 
-        let metric = self.metric;
         let asc = self.ascending;
-        let dir_id = dir;
-        kids.sort_by(|&a, &b| {
-            let na = m.node(a);
-            let nb = m.node(b);
-            // Directories always sort above files within name ordering.
-            let ord = match self.sort_col {
-                COL_NAME => na.name.to_string_lossy().cmp(&nb.name.to_string_lossy()),
-                COL_SIZE | COL_PERCENT => metric
-                    .pick(nb.agg_logical, nb.agg_allocated)
-                    .cmp(&metric.pick(na.agg_logical, na.agg_allocated)),
-                COL_ITEMS => (nb.file_count + nb.dir_count).cmp(&(na.file_count + na.dir_count)),
-                COL_MODIFIED => nb.modified_ms.cmp(&na.modified_ms),
-                _ => std::cmp::Ordering::Equal,
-            };
-            if self.sort_col == COL_NAME {
-                if asc { ord } else { ord.reverse() }
-            } else {
-                if asc { ord.reverse() } else { ord }
+        match self.sort_col {
+            COL_NAME => {
+                // Case-insensitive by normalized form; directories first.
+                rows.sort_by(|a, b| dir_first(a, b).then(a.name.cmp(&b.name)));
+                if !asc {
+                    rows.reverse();
+                }
             }
-        });
-        let _ = dir_id;
-        self.rows = kids;
+            COL_SIZE | COL_PERCENT => {
+                rows.sort_by(|a, b| b.size.cmp(&a.size));
+                if asc {
+                    rows.reverse();
+                }
+            }
+            COL_ITEMS => {
+                rows.sort_by(|a, b| b.items.cmp(&a.items));
+                if asc {
+                    rows.reverse();
+                }
+            }
+            COL_MODIFIED => {
+                rows.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+                if asc {
+                    rows.reverse();
+                }
+            }
+            _ => {}
+        }
+        self.rows = rows;
     }
 
     pub fn set_metric(&mut self, metric: SizeMetric) {
@@ -147,15 +189,24 @@ impl FileTableDelegate {
     }
 
     pub fn row_of_node(&self, node: NodeId) -> Option<usize> {
-        self.rows.iter().position(|&r| r == node)
+        self.rows.iter().position(|r| r.id == node)
     }
+}
 
-    fn cell_size(&self, node: NodeId) -> u64 {
-        let Some(model) = &self.model else { return 0 };
-        let m = model.read();
-        let n = m.node(node);
-        self.metric.pick(n.agg_logical, n.agg_allocated)
+fn dir_first(a: &RowView, b: &RowView) -> std::cmp::Ordering {
+    let a_dir = a.kind == NodeKind::Directory;
+    let b_dir = b.kind == NodeKind::Directory;
+    b_dir.cmp(&a_dir)
+}
+
+/// Case-insensitive substring test on already-normalized bytes.
+fn memmem_like(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
     }
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle)
 }
 
 impl Default for FileTableDelegate {
@@ -196,91 +247,67 @@ impl TableDelegate for FileTableDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let Some(&node) = self.rows.get(row_ix) else {
+        let Some(row) = self.rows.get(row_ix) else {
             return div().into_any_element();
         };
         let theme = cx.theme();
 
         match col_ix {
             COL_NAME => {
-                let (name, kind, flags) = {
-                    let Some(model) = &self.model else {
-                        return div().into_any_element();
-                    };
-                    let m = model.read();
-                    let n = m.node(node);
-                    (n.name.to_string_lossy().into_owned(), n.kind, n.flags)
-                };
-                let icon = match kind {
+                let icon = match row.kind {
                     NodeKind::Directory => IconName::Folder,
                     NodeKind::File => IconName::File,
                     NodeKind::Symlink => IconName::ExternalLink,
                     NodeKind::Other => IconName::File,
                 };
-                let mut row = h_flex().gap_1p5().items_center().overflow_hidden().child(
+                let mut cell = h_flex().gap_1p5().items_center().overflow_hidden().child(
                     Icon::new(icon)
                         .small()
-                        .text_color(if kind == NodeKind::Directory {
+                        .text_color(if row.kind == NodeKind::Directory {
                             theme.primary
                         } else {
                             theme.muted_foreground
                         }),
                 );
-                row = row.child(div().truncate().child(name));
-                if flags & HARDLINK_SHARED != 0 {
-                    row = row.child(
+                cell = cell.child(div().truncate().child(row.name.clone()));
+                if row.flags & HARDLINK_SHARED != 0 {
+                    cell = cell.child(
                         Icon::new(IconName::Copy)
                             .xsmall()
                             .text_color(theme.muted_foreground),
                     );
                 }
-                if flags & MOUNT_BOUNDARY != 0 {
-                    row = row.child(Icon::new(IconName::Globe).xsmall().text_color(theme.info));
+                if row.flags & MOUNT_BOUNDARY != 0 {
+                    cell = cell.child(Icon::new(IconName::Globe).xsmall().text_color(theme.info));
                 }
-                row.into_any_element()
+                cell.into_any_element()
             }
             COL_SIZE => div()
                 .text_right()
-                .child(format_size(self.cell_size(node)))
+                .child(format_size(row.size))
                 .into_any_element(),
             COL_PERCENT => div()
                 .text_right()
                 .text_color(theme.muted_foreground)
-                .child(format_percent(self.cell_size(node), self.dir_total))
+                .child(format_percent(row.size, self.dir_total))
                 .into_any_element(),
             COL_ITEMS => {
-                let items = {
-                    let Some(model) = &self.model else {
-                        return div().into_any_element();
-                    };
-                    let m = model.read();
-                    let n = m.node(node);
-                    if n.is_dir() {
-                        n.file_count + n.dir_count
-                    } else {
-                        return div()
-                            .text_right()
-                            .text_color(theme.muted_foreground)
-                            .child("-")
-                            .into_any_element();
-                    }
-                };
-                div()
-                    .text_right()
-                    .child(format_count(items))
-                    .into_any_element()
+                if row.kind == NodeKind::Directory && row.items > 0 {
+                    div()
+                        .text_right()
+                        .child(format_count(row.items - if false {1} else {0}))
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_right()
+                        .text_color(theme.muted_foreground)
+                        .child("-")
+                        .into_any_element()
+                }
             }
-            COL_MODIFIED => {
-                let ms = {
-                    let Some(model) = &self.model else {
-                        return div().into_any_element();
-                    };
-                    model.read().node(node).modified_ms
-                };
-                div()
-                    .child(format_modified(ms, chrono_now_ms()))
-                    .into_any_element()
-            }
+            COL_MODIFIED => div()
+                .child(format_modified(row.modified_ms, chrono_now_ms()))
+                .into_any_element(),
             _ => "".into_any_element(),
         }
     }
@@ -292,18 +319,15 @@ impl TableDelegate for FileTableDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(&node) = self.rows.get(row_ix) else {
+        let Some(row) = self.rows.get(row_ix) else {
             return menu;
         };
-        let (is_dir, hardlink) = {
-            let Some(model) = &self.model else {
-                return menu;
-            };
-            let m = model.read();
-            let n = m.node(node);
-            (n.is_dir(), n.flags & HARDLINK_SHARED != 0)
-        };
-        menus::node_context_menu(menu, node, is_dir, hardlink)
+        menus::node_context_menu(
+            menu,
+            row.id,
+            row.kind == NodeKind::Directory,
+            row.flags & HARDLINK_SHARED != 0,
+        )
     }
 }
 

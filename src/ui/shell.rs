@@ -49,6 +49,9 @@ pub struct AppShell {
     pub search_results: Vec<NodeId>,
     /// Node id under the mouse in the treemap, for highlight + tooltip.
     pub treemap_hovered: Option<u32>,
+    /// Cached treemap weights; invalidated by `view_version` bumps
+    /// (navigation, filter, metric, deletions) instead of rebuilt per frame.
+    pub(super) treemap_cache: Option<(u64, u64, Vec<crate::treemap::layout::TreemapItem>)>,
     /// The query the current results belong to (normalized).
     pub search_query_active: String,
     /// Guards stale background searches from overwriting newer ones.
@@ -141,6 +144,7 @@ impl AppShell {
             search_index: None,
             search_results: Vec::new(),
             treemap_hovered: None,
+            treemap_cache: None,
             search_query_active: String::new(),
             search_generation: 0,
             table,
@@ -350,17 +354,17 @@ impl AppShell {
     }
 
     fn on_table_select(&mut self, row: usize, cx: &mut Context<Self>) {
-        if let Some(&n) = self.table.read(cx).delegate().rows.get(row)
-            && self.state.selected_node != Some(n)
+        if let Some(row) = self.table.read(cx).delegate().rows.get(row)
+            && self.state.selected_node != Some(row.id)
         {
-            self.state.selected_node = Some(n);
+            self.state.selected_node = Some(row.id);
             cx.notify();
         }
     }
 
     fn on_table_activate(&mut self, row: usize, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&n) = self.table.read(cx).delegate().rows.get(row) {
-            self.activate_node(n, cx);
+        if let Some(row) = self.table.read(cx).delegate().rows.get(row) {
+            self.activate_node(row.id, cx);
         }
     }
 
