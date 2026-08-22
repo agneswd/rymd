@@ -86,6 +86,16 @@ pub fn detect(
     cancelled: &AtomicBool,
     progress: &FinderProgress,
 ) -> Vec<DuplicateGroup> {
+    // Hard-link siblings share an identity and are never waste; keep only
+    // the first path per identity so they never form phantom groups.
+    // Unknown identities (0, 0) stay: dropping them could merge unrelated
+    // files on platforms where identity lookup failed.
+    let mut candidates = candidates;
+    {
+        let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        candidates.retain(|c| c.identity == (0, 0) || seen.insert(c.identity));
+    }
+
     let mut by_size: HashMap<u64, Vec<NodeId>> = HashMap::new();
     let mut sizes: HashMap<NodeId, (PathBuf, (u64, u64))> =
         HashMap::with_capacity(candidates.len());

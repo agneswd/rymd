@@ -23,40 +23,40 @@ pub fn verify_unchanged(model: &ScanModel, node: NodeId) -> bool {
 pub fn verify_identity(path: &Path, device: u64, inode: u64, kind: NodeKind) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(md) => {
-            let dev_ok = dev_of(&md) == Some(device);
-            let ino_ok = ino_of(&md) == Some(inode);
             let kind_ok = match kind {
                 NodeKind::Directory => md.is_dir(),
                 NodeKind::File => md.is_file(),
                 NodeKind::Symlink => md.is_symlink(),
                 NodeKind::Other => true,
             };
-            dev_ok && ino_ok && kind_ok
+            if !kind_ok {
+                return false;
+            }
+            identity_matches(path, device, inode)
         }
         Err(_) => false,
     }
 }
 
 #[cfg(unix)]
-fn dev_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.dev())
-}
-#[cfg(not(unix))]
-fn dev_of(_: &std::fs::Metadata) -> Option<u64> {
-    None
+fn identity_matches(path: &Path, device: u64, inode: u64) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            use std::os::unix::fs::MetadataExt;
+            md.dev() == device && md.ino() == inode
+        }
+        Err(_) => false,
+    }
 }
 
-#[cfg(unix)]
-fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.ino())
-}
-#[cfg(not(unix))]
-fn ino_of(md: &std::fs::Metadata) -> Option<u64> {
-    // No stable file index without opening a handle here; fall back to a
-    // weak identity so verification still catches renames and rewrites.
-    Some(md.len())
+#[cfg(windows)]
+fn identity_matches(path: &Path, device: u64, inode: u64) -> bool {
+    // Directory entries carry no stable id here; open the object (never
+    // following reparse points) and compare volume serial + file index.
+    match crate::scan::platform::windows::identity_of(path) {
+        Ok((vol, index, _links)) => vol == device && index == inode,
+        Err(_) => false,
+    }
 }
 
 /// Never allow these targets to be deleted.
