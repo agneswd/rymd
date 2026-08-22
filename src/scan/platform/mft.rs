@@ -37,6 +37,8 @@ pub enum MftError {
     OutOfBounds,
     /// A required attribute is missing or malformed.
     MalformedAttribute,
+    /// An extent map is truncated, out of order, or incomplete.
+    IncompleteExtentMap,
 }
 
 const RECORD_HEADER_MIN_LEN: usize = 0x18;
@@ -825,6 +827,154 @@ pub fn create_synthetic_record(
     rec
 }
 
+/// An extent in an MFT stream mapping (VCN range to optional LCN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MftExtent {
+    pub vcn_start: u64,
+    pub next_vcn: u64,
+    pub lcn: Option<u64>,
+}
+
+/// Parse a raw `RETRIEVAL_POINTERS_BUFFER` received from `FSCTL_GET_RETRIEVAL_POINTERS`.
+///
+/// Windows layout:
+/// - 0x00..0x04: `ExtentCount` (`u32`)
+/// - 0x04..0x08: padding / unused (`u32`)
+/// - 0x08..0x10: `StartingVcn` (`LARGE_INTEGER` as `i64` / `u64`)
+/// - Array of extents starting at 0x10, each 16 bytes:
+///   - 0x00..0x08: `NextVcn` (`i64` / `u64`)
+///   - 0x08..0x10: `Lcn` (`i64` / `u64`, -1 / `u64::MAX` indicates unmapped / sparse)
+///
+/// Returns `(next_starting_vcn, extents)` on success.
+pub fn parse_retrieval_pointers_buffer(
+    buf: &[u8],
+    expected_starting_vcn: u64,
+) -> Result<(u64, Vec<MftExtent>), MftError> {
+    if buf.len() < 16 {
+        return Err(MftError::OutOfBounds);
+    }
+    let extent_count = u32_at(buf, 0) as usize;
+    if extent_count == 0 {
+        return Err(MftError::IncompleteExtentMap);
+    }
+    let starting_vcn = u64_at(buf, 8);
+    if starting_vcn != expected_starting_vcn {
+        return Err(MftError::IncompleteExtentMap);
+    }
+    let required_len = 16usize
+        .checked_add(extent_count.checked_mul(16).ok_or(MftError::OutOfBounds)?)
+        .ok_or(MftError::OutOfBounds)?;
+    if buf.len() < required_len {
+        return Err(MftError::OutOfBounds);
+    }
+
+    let mut extents = Vec::with_capacity(extent_count);
+    let mut current_vcn = starting_vcn;
+
+    for i in 0..extent_count {
+        let off = 16 + i * 16;
+        let next_vcn = u64_at(buf, off);
+        let lcn_raw = u64_at(buf, off + 8);
+
+        if next_vcn <= current_vcn {
+            return Err(MftError::IncompleteExtentMap);
+        }
+
+        let lcn = if lcn_raw == u64::MAX || lcn_raw as i64 == -1 {
+            None
+        } else {
+            Some(lcn_raw)
+        };
+
+        extents.push(MftExtent {
+            vcn_start: current_vcn,
+            next_vcn,
+            lcn,
+        });
+        current_vcn = next_vcn;
+    }
+
+    Ok((current_vcn, extents))
+}
+
+/// Convert `(lcn, cluster_count)` pairs from `decode_runs` into contiguous `MftExtent`s.
+pub fn runs_to_extents(runs: &[(u64, u64)]) -> Result<Vec<MftExtent>, MftError> {
+    let mut extents = Vec::with_capacity(runs.len());
+    let mut current_vcn = 0u64;
+    for &(lcn, clusters) in runs {
+        if clusters == 0 {
+            return Err(MftError::MalformedAttribute);
+        }
+        let next_vcn = current_vcn
+            .checked_add(clusters)
+            .ok_or(MftError::OutOfBounds)?;
+        extents.push(MftExtent {
+            vcn_start: current_vcn,
+            next_vcn,
+            lcn: Some(lcn),
+        });
+        current_vcn = next_vcn;
+    }
+    Ok(extents)
+}
+
+/// Validate an extent map for VCN continuity, volume boundary safety, and coverage.
+///
+/// Ensures:
+/// - Map starts at VCN 0.
+/// - Every extent has strictly positive length (`next_vcn > vcn_start`).
+/// - Extents are contiguous without gaps or overlapping VCN ranges.
+/// - Allocated LCN ranges do not overflow and fit within `total_volume_clusters`.
+/// - Total VCN coverage in bytes meets or exceeds `mft_valid_length`.
+///
+/// Returns the physical `(lcn, cluster_count)` extents for volume reads.
+pub fn validate_and_convert_extents(
+    extents: &[MftExtent],
+    mft_valid_length: u64,
+    bytes_per_cluster: u64,
+    total_volume_clusters: u64,
+) -> Result<Vec<(u64, u64)>, MftError> {
+    if extents.is_empty() || bytes_per_cluster == 0 {
+        return Err(MftError::IncompleteExtentMap);
+    }
+    if extents[0].vcn_start != 0 {
+        return Err(MftError::IncompleteExtentMap);
+    }
+
+    let mut prev_next_vcn = 0u64;
+    let mut physical_extents = Vec::with_capacity(extents.len());
+
+    for (i, extent) in extents.iter().enumerate() {
+        if extent.next_vcn <= extent.vcn_start {
+            return Err(MftError::IncompleteExtentMap);
+        }
+        if i > 0 && extent.vcn_start != prev_next_vcn {
+            return Err(MftError::IncompleteExtentMap);
+        }
+        prev_next_vcn = extent.next_vcn;
+
+        let clusters = extent.next_vcn - extent.vcn_start;
+
+        if let Some(lcn) = extent.lcn {
+            let end_lcn = lcn.checked_add(clusters).ok_or(MftError::OutOfBounds)?;
+            if total_volume_clusters > 0 && end_lcn > total_volume_clusters {
+                return Err(MftError::OutOfBounds);
+            }
+            physical_extents.push((lcn, clusters));
+        }
+    }
+
+    let total_clusters = prev_next_vcn;
+    let total_bytes = total_clusters
+        .checked_mul(bytes_per_cluster)
+        .ok_or(MftError::OutOfBounds)?;
+    if total_bytes < mft_valid_length {
+        return Err(MftError::IncompleteExtentMap);
+    }
+
+    Ok(physical_extents)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
@@ -1527,6 +1677,309 @@ mod tests {
         assert_eq!(entries[1].record_no, 16);
         assert_eq!(entries[2].record_no, 22);
     }
+
+    #[test]
+    fn unnamed_attribute_with_nonzero_record_length_byte_6() {
+        // Attribute with length 0x010020 (byte 4=0x20, byte 5=0x00, byte 6=0x01, byte 7=0x00).
+        // NameLength at 0x09 is 0 (unnamed).
+        let mut attr = vec![0u8; 0x30];
+        attr[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr[4..8].copy_from_slice(&0x010020u32.to_le_bytes());
+        attr[8] = 1; // non-resident
+        attr[9] = 0; // NameLength = 0 (unnamed)
+        assert_eq!(attr[6], 1); // Byte 6 is non-zero
+        assert!(attribute_is_unnamed(&attr));
+    }
+
+    #[test]
+    fn named_attribute_with_nonzero_name_length_not_unnamed() {
+        // Attribute with NameLength at 0x09 = 4 (named ADS).
+        let mut attr = vec![0u8; 0x30];
+        attr[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr[4..8].copy_from_slice(&0x30u32.to_le_bytes());
+        attr[8] = 0; // resident
+        attr[9] = 4; // NameLength = 4
+        assert!(!attribute_is_unnamed(&attr));
+    }
+
+    #[test]
+    fn single_extent_retrieval_pointers_and_validation() {
+        let mut buf = vec![0u8; 32];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // ExtentCount = 1
+        buf[8..16].copy_from_slice(&0u64.to_le_bytes()); // StartingVcn = 0
+        buf[16..24].copy_from_slice(&100u64.to_le_bytes()); // NextVcn = 100
+        buf[24..32].copy_from_slice(&5000u64.to_le_bytes()); // Lcn = 5000
+
+        let (next_vcn, extents) = parse_retrieval_pointers_buffer(&buf, 0).unwrap();
+        assert_eq!(next_vcn, 100);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(
+            extents[0],
+            MftExtent {
+                vcn_start: 0,
+                next_vcn: 100,
+                lcn: Some(5000),
+            }
+        );
+
+        let physical = validate_and_convert_extents(&extents, 100 * 4096, 4096, 10000).unwrap();
+        assert_eq!(physical, vec![(5000, 100)]);
+    }
+
+    #[test]
+    fn multiple_contiguous_and_fragmented_extents() {
+        let extents = vec![
+            MftExtent {
+                vcn_start: 0,
+                next_vcn: 50,
+                lcn: Some(1000),
+            },
+            MftExtent {
+                vcn_start: 50,
+                next_vcn: 120,
+                lcn: Some(2500),
+            },
+            MftExtent {
+                vcn_start: 120,
+                next_vcn: 200,
+                lcn: Some(4000),
+            },
+        ];
+        let physical = validate_and_convert_extents(&extents, 200 * 4096, 4096, 10000).unwrap();
+        assert_eq!(physical, vec![(1000, 50), (2500, 70), (4000, 80)]);
+    }
+
+    #[test]
+    fn multiple_retrieval_pointer_responses_simulated() {
+        // Chunk 1: StartingVcn = 0, Extents: 0..50 (LCN 1000), 50..100 (LCN 2000)
+        let mut chunk1 = vec![0u8; 48];
+        chunk1[0..4].copy_from_slice(&2u32.to_le_bytes());
+        chunk1[8..16].copy_from_slice(&0u64.to_le_bytes());
+        chunk1[16..24].copy_from_slice(&50u64.to_le_bytes());
+        chunk1[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        chunk1[32..40].copy_from_slice(&100u64.to_le_bytes());
+        chunk1[40..48].copy_from_slice(&2000u64.to_le_bytes());
+
+        let (next_vcn1, extents1) = parse_retrieval_pointers_buffer(&chunk1, 0).unwrap();
+        assert_eq!(next_vcn1, 100);
+
+        // Chunk 2: StartingVcn = 100, Extents: 100..150 (LCN 3000), 150..200 (LCN 4000)
+        let mut chunk2 = vec![0u8; 48];
+        chunk2[0..4].copy_from_slice(&2u32.to_le_bytes());
+        chunk2[8..16].copy_from_slice(&100u64.to_le_bytes());
+        chunk2[16..24].copy_from_slice(&150u64.to_le_bytes());
+        chunk2[24..32].copy_from_slice(&3000u64.to_le_bytes());
+        chunk2[32..40].copy_from_slice(&200u64.to_le_bytes());
+        chunk2[40..48].copy_from_slice(&4000u64.to_le_bytes());
+
+        let (next_vcn2, extents2) = parse_retrieval_pointers_buffer(&chunk2, 100).unwrap();
+        assert_eq!(next_vcn2, 200);
+
+        let mut all_extents = extents1;
+        all_extents.extend(extents2);
+
+        let physical = validate_and_convert_extents(&all_extents, 200 * 4096, 4096, 10000).unwrap();
+        assert_eq!(
+            physical,
+            vec![(1000, 50), (2000, 50), (3000, 50), (4000, 50)]
+        );
+    }
+
+    #[test]
+    fn incomplete_extent_map_shorter_than_mft_valid_length_rejected() {
+        let extents = vec![MftExtent {
+            vcn_start: 0,
+            next_vcn: 10, // 10 clusters * 4096 = 40,960 bytes
+            lcn: Some(100),
+        }];
+        // mft_valid_length is 81,920 bytes (20 clusters)
+        let res = validate_and_convert_extents(&extents, 81920, 4096, 1000);
+        assert_eq!(res.unwrap_err(), MftError::IncompleteExtentMap);
+    }
+
+    #[test]
+    fn overlapping_and_gapped_vcn_ranges_rejected() {
+        // Overlapping VCN ranges (0..100 and 80..150)
+        let overlap = vec![
+            MftExtent {
+                vcn_start: 0,
+                next_vcn: 100,
+                lcn: Some(1000),
+            },
+            MftExtent {
+                vcn_start: 80,
+                next_vcn: 150,
+                lcn: Some(2000),
+            },
+        ];
+        assert_eq!(
+            validate_and_convert_extents(&overlap, 100 * 4096, 4096, 10000).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+
+        // Gap in VCN ranges (0..100 and 110..200)
+        let gap = vec![
+            MftExtent {
+                vcn_start: 0,
+                next_vcn: 100,
+                lcn: Some(1000),
+            },
+            MftExtent {
+                vcn_start: 110,
+                next_vcn: 200,
+                lcn: Some(2000),
+            },
+        ];
+        assert_eq!(
+            validate_and_convert_extents(&gap, 200 * 4096, 4096, 10000).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+
+        // Map not starting at VCN 0
+        let non_zero_start = vec![MftExtent {
+            vcn_start: 5,
+            next_vcn: 100,
+            lcn: Some(1000),
+        }];
+        assert_eq!(
+            validate_and_convert_extents(&non_zero_start, 100 * 4096, 4096, 10000).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+    }
+
+    #[test]
+    fn backwards_and_zero_length_extents_rejected() {
+        let mut buf = vec![0u8; 32];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&100u64.to_le_bytes());
+        // NextVcn <= StartingVcn (100 -> 100 is zero-length, 100 -> 50 is backwards)
+        buf[16..24].copy_from_slice(&100u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&500u64.to_le_bytes());
+
+        assert_eq!(
+            parse_retrieval_pointers_buffer(&buf, 100).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+
+        buf[16..24].copy_from_slice(&50u64.to_le_bytes());
+        assert_eq!(
+            parse_retrieval_pointers_buffer(&buf, 100).unwrap_err(),
+            MftError::IncompleteExtentMap
+        );
+    }
+
+    #[test]
+    fn arithmetic_overflow_and_volume_boundary_rejected() {
+        // LCN + clusters overflows u64
+        let overflow = vec![MftExtent {
+            vcn_start: 0,
+            next_vcn: 100,
+            lcn: Some(u64::MAX - 10),
+        }];
+        assert_eq!(
+            validate_and_convert_extents(&overflow, 100 * 4096, 4096, 0).unwrap_err(),
+            MftError::OutOfBounds
+        );
+
+        // LCN + clusters exceeds total volume clusters
+        let out_of_bounds = vec![MftExtent {
+            vcn_start: 0,
+            next_vcn: 100,
+            lcn: Some(950),
+        }];
+        assert_eq!(
+            validate_and_convert_extents(&out_of_bounds, 100 * 4096, 4096, 1000).unwrap_err(),
+            MftError::OutOfBounds
+        );
+    }
+
+    #[test]
+    fn sparse_and_unmapped_extents_handled() {
+        let mut buf = vec![0u8; 32];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&0u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&50u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&u64::MAX.to_le_bytes()); // Sparse LCN
+
+        let (next_vcn, extents) = parse_retrieval_pointers_buffer(&buf, 0).unwrap();
+        assert_eq!(next_vcn, 50);
+        assert_eq!(extents[0].lcn, None);
+
+        let physical = validate_and_convert_extents(&extents, 50 * 4096, 4096, 1000).unwrap();
+        assert_eq!(physical, vec![]); // Sparse extents produce no physical read requests
+    }
+
+    #[test]
+    fn runs_to_extents_conversion_and_validation() {
+        let runs = vec![(1000, 50), (2000, 30)];
+        let extents = runs_to_extents(&runs).unwrap();
+        assert_eq!(extents.len(), 2);
+        assert_eq!(
+            extents[0],
+            MftExtent {
+                vcn_start: 0,
+                next_vcn: 50,
+                lcn: Some(1000),
+            }
+        );
+        assert_eq!(
+            extents[1],
+            MftExtent {
+                vcn_start: 50,
+                next_vcn: 80,
+                lcn: Some(2000),
+            }
+        );
+
+        let physical = validate_and_convert_extents(&extents, 80 * 4096, 4096, 10000).unwrap();
+        assert_eq!(physical, vec![(1000, 50), (2000, 30)]);
+    }
+
+    #[test]
+    fn exact_coverage_and_final_partial_record_coverage() {
+        let cancel = AtomicBool::new(false);
+        let rs = 1024;
+
+        // Exact coverage: 5 records = 5120 bytes
+        let mut stream = vec![0u8; 5 * rs];
+        for i in 0..5 {
+            let rec = create_synthetic_record(i, 5, &format!("f{i}"), false, 100, 4096);
+            stream[i as usize * rs..(i as usize + 1) * rs].copy_from_slice(&rec);
+        }
+        let mut parser_exact = MftStreamParser::new(rs, 5120);
+        parser_exact.process_chunk(&mut stream, &cancel).unwrap();
+        let processed_exact = parser_exact.next_record_no() * (rs as u64);
+        assert_eq!(processed_exact, 5120);
+        assert!(processed_exact >= 5120);
+
+        // Final partial record: 5 records + 300 bytes = 5420 bytes
+        let mut stream_partial = vec![0u8; 6 * rs];
+        for i in 0..6 {
+            let rec = create_synthetic_record(i, 5, &format!("f{i}"), false, 100, 4096);
+            stream_partial[i as usize * rs..(i as usize + 1) * rs].copy_from_slice(&rec);
+        }
+        let mut parser_partial = MftStreamParser::new(rs, 5420);
+        parser_partial
+            .process_chunk(&mut stream_partial, &cancel)
+            .unwrap();
+        let processed_partial = parser_partial.next_record_no() * (rs as u64);
+        assert_eq!(processed_partial, 6144);
+        assert!(processed_partial >= 5420);
+
+        // Incomplete stream: expected 10240 bytes (10 records), but only 5 records provided
+        let mut stream_short = vec![0u8; 5 * rs];
+        for i in 0..5 {
+            let rec = create_synthetic_record(i, 5, &format!("f{i}"), false, 100, 4096);
+            stream_short[i as usize * rs..(i as usize + 1) * rs].copy_from_slice(&rec);
+        }
+        let mut parser_short = MftStreamParser::new(rs, 10240);
+        parser_short
+            .process_chunk(&mut stream_short, &cancel)
+            .unwrap();
+        let processed_short = parser_short.next_record_no() * (rs as u64);
+        assert_eq!(processed_short, 5120);
+        assert!(processed_short < 10240); // Incomplete coverage detected!
+    }
 }
 
 /// Volume access and MFT streaming (Windows only).
@@ -1548,12 +2001,17 @@ pub mod reader {
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use super::{
-        ATTR_TYPE_DATA, MftStreamParser, apply_fixups, attributes, build_model, decode_runs,
-        parse_data_attr,
+        ATTR_TYPE_DATA, MftExtent, MftStreamParser, apply_fixups, attribute_is_unnamed, attributes,
+        build_model, decode_runs, parse_data_attr, parse_retrieval_pointers_buffer,
+        runs_to_extents, u32_at, validate_and_convert_extents,
     };
     use crate::model::ScanModel;
 
     const FSCTL_GET_NTFS_VOLUME_DATA: u32 = 0x0009_0026;
+    const FSCTL_GET_RETRIEVAL_POINTERS: u32 = 0x0009_0073;
+    const ERROR_MORE_DATA: u32 = 234;
+    const ERROR_HANDLE_EOF: u32 = 38;
+
     /// Bytes read from the volume per I/O.
     const READ_CHUNK: usize = 8 * 1024 * 1024;
 
@@ -1561,6 +2019,7 @@ pub mod reader {
     #[derive(Clone, Copy)]
     struct VolumeData {
         serial: u64,
+        total_clusters: u64,
         bytes_per_cluster: u64,
         bytes_per_record: u64,
         mft_start_lcn: u64,
@@ -1585,7 +2044,7 @@ pub mod reader {
             && b[1] == b':'
             && b[2..].iter().all(|c| *c == b'\\' || *c == b'/')
         {
-            Some((b[0] as char).to_ascii_uppercase().to_string())
+            Some(format!("{}:", (b[0] as char).to_ascii_uppercase()))
         } else {
             None
         }
@@ -1613,7 +2072,7 @@ pub mod reader {
                 "cannot open volume {drive} (administrator rights required): {err}"
             ));
         }
-        let result = scan_with_handle(handle, root, cancel);
+        let result = scan_with_handle(handle, &drive, root, cancel);
         // SAFETY: created above, closed exactly once.
         unsafe { CloseHandle(handle) };
         result
@@ -1681,23 +2140,112 @@ pub mod reader {
         let le_u32 = |o: usize| u32::from_le_bytes(out[o..o + 4].try_into().unwrap());
         Ok(VolumeData {
             serial: le_u64(0),
+            total_clusters: le_u64(16),
             free_clusters: le_u64(24),
             mft_valid_length: le_u64(56),
-            bytes_per_cluster: le_u32(44) as u64,
-            bytes_per_record: le_u32(48) as u64,
+            bytes_per_cluster: (le_u32(44) as u64).max(512),
+            bytes_per_record: (le_u32(48) as u64).max(128),
             mft_start_lcn: le_u64(64),
         })
     }
 
-    /// Locate `$MFT`'s extents by parsing record 0's unnamed `$DATA`.
-    fn mft_extents(handle: HANDLE, vd: &VolumeData) -> Result<Vec<(u64, u64)>, String> {
+    fn query_retrieval_pointers(drive: &str) -> Result<Vec<MftExtent>, String> {
+        let mft_path = wide(&format!(r"\\.\{drive}\$MFT"));
+        // SAFETY: path is a null-terminated wide string; open with read attributes and maximum sharing.
+        let handle = unsafe {
+            CreateFileW(
+                mft_path.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(format!("cannot open $MFT on {drive}: {}", io_err()));
+        }
+
+        let mut all_extents = Vec::new();
+        let mut starting_vcn = 0u64;
+        let mut out_buf = vec![0u8; 64 * 1024];
+
+        loop {
+            let in_buf = starting_vcn.to_le_bytes();
+            let mut returned: u32 = 0;
+            // SAFETY: valid handle, input buffer is 8 bytes, output buffer is allocated.
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    FSCTL_GET_RETRIEVAL_POINTERS,
+                    in_buf.as_ptr().cast(),
+                    in_buf.len() as u32,
+                    out_buf.as_mut_ptr().cast(),
+                    out_buf.len() as u32,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if ok != 0 {
+                let (_, extents) =
+                    parse_retrieval_pointers_buffer(&out_buf[..returned as usize], starting_vcn)
+                        .map_err(|e| format!("parse retrieval pointers failed: {e:?}"))?;
+                all_extents.extend(extents);
+                break;
+            }
+
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if err == ERROR_MORE_DATA {
+                let (next_vcn, extents) =
+                    parse_retrieval_pointers_buffer(&out_buf[..returned as usize], starting_vcn)
+                        .map_err(|e| format!("parse retrieval pointers chunk failed: {e:?}"))?;
+                if extents.is_empty() || next_vcn <= starting_vcn {
+                    unsafe { CloseHandle(handle) };
+                    return Err("retrieval pointers progress stalled".into());
+                }
+                all_extents.extend(extents);
+                starting_vcn = next_vcn;
+            } else if err == ERROR_HANDLE_EOF {
+                break;
+            } else {
+                unsafe { CloseHandle(handle) };
+                return Err(format!("FSCTL_GET_RETRIEVAL_POINTERS failed: {err}"));
+            }
+        }
+
+        unsafe { CloseHandle(handle) };
+        Ok(all_extents)
+    }
+
+    /// Locate all `$MFT` extents, attempting `FSCTL_GET_RETRIEVAL_POINTERS` first,
+    /// and falling back to Record 0 run-list parsing.
+    fn mft_extents(
+        volume_handle: HANDLE,
+        drive: &str,
+        vd: &VolumeData,
+    ) -> Result<Vec<(u64, u64)>, String> {
+        // Attempt 1: Query full extent map via FSCTL_GET_RETRIEVAL_POINTERS on $MFT.
+        if let Ok(extents) = query_retrieval_pointers(drive)
+            && let Ok(physical) = validate_and_convert_extents(
+                &extents,
+                vd.mft_valid_length,
+                vd.bytes_per_cluster,
+                vd.total_clusters,
+            )
+        {
+            return Ok(physical);
+        }
+
+        // Attempt 2: Fall back to parsing Record 0's unnamed $DATA run list.
         let offset = vd
             .mft_start_lcn
             .checked_mul(vd.bytes_per_cluster)
             .ok_or("MFT location overflows")?;
-        seek_to(handle, offset)?;
+        seek_to(volume_handle, offset)?;
         let mut rec = vec![0u8; vd.bytes_per_record.max(1024) as usize];
-        read_exact(handle, &mut rec)?;
+        read_exact(volume_handle, &mut rec)?;
         if rec.len() < 4 || &rec[0..4] != b"FILE" {
             return Err("MFT record 0 lacks the FILE magic".into());
         }
@@ -1706,14 +2254,23 @@ pub mod reader {
         for attr in attributes(&rec) {
             if attr.len() >= 0x10
                 && u32_at(attr, 0) == ATTR_TYPE_DATA
-                && attr.get(6).copied().unwrap_or(1) == 0 // unnamed stream
+                && attribute_is_unnamed(attr)
                 && attr.get(8).copied().unwrap_or(0) != 0
             // non-resident
             {
                 let info = parse_data_attr(attr).map_err(|e| format!("{e:?}"))?;
                 let runs_end = (info.runs_offset + info.runs_len).min(attr.len());
-                return decode_runs(&attr[info.runs_offset..runs_end])
-                    .map_err(|e| format!("$MFT run list malformed: {e:?}"));
+                let raw_runs = decode_runs(&attr[info.runs_offset..runs_end])
+                    .map_err(|e| format!("$MFT run list malformed: {e:?}"))?;
+                let extents = runs_to_extents(&raw_runs)
+                    .map_err(|e| format!("$MFT run list conversion failed: {e:?}"))?;
+                return validate_and_convert_extents(
+                    &extents,
+                    vd.mft_valid_length,
+                    vd.bytes_per_cluster,
+                    vd.total_clusters,
+                )
+                .map_err(|e| format!("$MFT extent validation failed: {e:?}"));
             }
         }
         Err("$MFT record has no non-resident data attribute".into())
@@ -1721,11 +2278,15 @@ pub mod reader {
 
     fn scan_with_handle(
         handle: HANDLE,
+        drive: &str,
         root: &Path,
         cancel: &AtomicBool,
     ) -> Result<ScanModel, String> {
         let vd = query_volume_data(handle)?;
-        let extents = mft_extents(handle, &vd)?;
+        if vd.mft_valid_length == 0 {
+            return Err("invalid volume metadata: mft_valid_length is zero".into());
+        }
+        let extents = mft_extents(handle, drive, &vd)?;
         let rs = vd.bytes_per_record.max(128) as usize;
 
         let mut parser = MftStreamParser::new(rs, vd.mft_valid_length);
@@ -1755,14 +2316,22 @@ pub mod reader {
             }
         }
 
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let processed_bytes = parser.next_record_no().saturating_mul(rs as u64);
+        if processed_bytes < vd.mft_valid_length {
+            return Err(format!(
+                "incomplete MFT scan: processed {processed_bytes} bytes, expected at least {}",
+                vd.mft_valid_length
+            ));
+        }
+
         let entries = parser.into_entries();
         let mut model =
             build_model(root, vd.serial, &entries).ok_or("MFT contains no root directory")?;
         model.free_space = Some(vd.free_clusters.saturating_mul(vd.bytes_per_cluster));
         Ok(model)
-    }
-
-    fn u32_at(buf: &[u8], off: usize) -> u32 {
-        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
     }
 }

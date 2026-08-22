@@ -131,13 +131,21 @@ Implemented / CI validated in this pass:
   `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` - names,
   attributes, logical size, allocation size (sparse/compression aware),
   timestamps and file ids come from directory records; one handle per
-  directory instead of one `CreateFileW` round trip per file.
+  directory instead of one `CreateFileW` round trip per file. Tested in
+  Windows CI.
 - Allocation sizes come from the records' `AllocationSize` field without
   forcing allocated size up to logical size for sparse or compressed
   files.
 - NTFS MFT streaming parser: parses complete records in-place directly from
   the read buffer without per-record allocations or buffer shifting.
   Carries only trailing incomplete records across chunk boundaries.
+- Complete MFT extent discovery: queries the full VCN-to-LCN extent map
+  using `FSCTL_GET_RETRIEVAL_POINTERS` across multiple response buffers,
+  with fallback to Record 0 run-list parsing.
+- Safe extent validation: strictly verifies VCN continuity and volume
+  boundaries. Incomplete extent maps or unconsumed streams trigger safe
+  fallback to the normal Windows bulk directory scanner instead of
+  returning partial filesystem results.
 - Synthetic MFT streaming benchmarks on Linux (`rymd-bench --mft N`):
   - 100k records (97.7 MiB): **12.7 ms** (~7.88 million records/s, 7.7 GB/s)
   - 500k records (488.3 MiB): **57.3 ms** (~8.72 million records/s, 8.5 GB/s)
@@ -146,19 +154,21 @@ Implemented / CI validated in this pass:
   memory moves (~32 GB memmove per 8 MiB buffer). The new parser is O(N)
   streaming with zero per-record heap allocations.
 - Strict parsers (directory records, MFT fixups/attributes/run lists,
-  streaming chunk parsers) are unit-tested on both Linux and Windows CI,
-  including truncated records, lying offsets, invalid fixups, split chunk
-  boundaries, sparse allocations, odd name lengths, and hostile parent
-  references.
+  streaming chunk parsers, retrieval-pointer buffers) are unit-tested on
+  both Linux and Windows CI, including truncated records, lying offsets,
+  invalid fixups, split chunk boundaries, sparse allocations, odd name
+  lengths, gapped/overlapping extents, and hostile parent references.
 - Hard-link counts are absent from bulk directory records, so links are
   not deduplicated on that path (every link counts its bytes); the MFT
   path counts storage once naturally.
 
 **Windows performance has not yet been benchmarked on real Windows
-hardware during this optimization pass. Windows scanner implementations
-are compile/test validated in CI. No performance claims against
-WinDirStat (or anything else) are made; benchmarking is deferred until
-reproducible Windows measurements can be run on real hardware.**
+hardware during this optimization pass. Normal Windows bulk directory
+enumeration is CI tested. MFT raw-volume scanning is parser/API
+validated but awaiting real Windows performance measurements. Incomplete
+MFT extent discovery now causes safe fallback to directory scanning
+instead of returning partial results. No performance claims against
+WinDirStat (or anything else) are made.**
 
 ## Reproducing
 
