@@ -392,9 +392,10 @@ fn run_pool(shared: &Arc<Shared>, workers: usize) {
     for j in joins {
         let _ = j.join();
     }
-    // Every worker has exited. If jobs are still outstanding, something
-    // went wrong that must not turn into a silent stall.
-    if !shared.sched.is_quiet() && shared.panic_msg.lock().is_none() {
+    // Every worker has exited. If jobs are still outstanding and this was
+    // not a deliberate cancellation, something went wrong that must not
+    // turn into a silent stall.
+    if !shared.is_cancelled() && !shared.sched.is_quiet() && shared.panic_msg.lock().is_none() {
         *shared.panic_msg.lock() = Some(format!(
             "scan stalled with {} outstanding jobs",
             shared.sched.outstanding()
