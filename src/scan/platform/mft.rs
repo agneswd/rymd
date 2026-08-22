@@ -202,7 +202,7 @@ pub fn parse_data_attr(attr: &[u8]) -> Result<DataInfo, MftError> {
         Ok(DataInfo {
             resident: true,
             real_size: value_len,
-            allocated_size: value_len.next_multiple_of(8),
+            allocated_size: 0,
             runs_offset: 0,
             runs_len: 0,
         })
@@ -527,7 +527,7 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
         )
     } else {
         match data {
-            Some(d) => (d.real_size, d.allocated_size.max(d.real_size)),
+            Some(d) => (d.real_size, d.allocated_size),
             None => (0, 0),
         }
     };
@@ -562,8 +562,221 @@ fn u16_at(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
+/// Streaming parser for MFT records across arbitrary chunk buffers.
+///
+/// Processes complete records in-place without copying or shifting buffer
+/// memory. Maintains carry only for partial records spanning chunk boundaries.
+pub struct MftStreamParser {
+    record_size: usize,
+    mft_valid_length: u64,
+    next_record_no: u64,
+    carry: Vec<u8>,
+    entries: Vec<Entry>,
+}
+
+impl MftStreamParser {
+    pub fn new(record_size: usize, mft_valid_length: u64) -> Self {
+        let rs = record_size.max(128);
+        Self {
+            record_size: rs,
+            mft_valid_length,
+            next_record_no: 0,
+            carry: Vec::with_capacity(rs),
+            entries: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<Entry> {
+        self.entries
+    }
+
+    pub fn next_record_no(&self) -> u64 {
+        self.next_record_no
+    }
+
+    /// Process a mutable chunk of MFT bytes.
+    ///
+    /// Fixups and attribute parsing happen in place within `chunk`.
+    /// Returns `Err("cancelled")` if `cancel` is set.
+    pub fn process_chunk(
+        &mut self,
+        mut chunk: &mut [u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, String> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let rs = self.record_size;
+
+        // If we have leftover bytes from a previous chunk, complete the record first.
+        if !self.carry.is_empty() {
+            let need = rs - self.carry.len();
+            if chunk.len() < need {
+                self.carry.extend_from_slice(chunk);
+                return Ok(true);
+            }
+            let (head, rest) = chunk.split_at_mut(need);
+            self.carry.extend_from_slice(head);
+            let record_no = self.next_record_no;
+            self.next_record_no += 1;
+            consume_record(record_no, &mut self.carry, &mut self.entries);
+            self.carry.clear();
+            chunk = rest;
+        }
+
+        // Process full records directly from `chunk` using in-place slices.
+        let mut chunks = chunk.chunks_exact_mut(rs);
+        for record_slice in &mut chunks {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            if self.next_record_no * (rs as u64) >= self.mft_valid_length {
+                return Ok(false);
+            }
+            let record_no = self.next_record_no;
+            self.next_record_no += 1;
+            consume_record(record_no, record_slice, &mut self.entries);
+        }
+
+        // Preserve trailing incomplete record as carry for next chunk.
+        let remainder = chunks.into_remainder();
+        if !remainder.is_empty() && self.next_record_no * (rs as u64) < self.mft_valid_length {
+            self.carry.extend_from_slice(remainder);
+        }
+
+        let keep_going = self.next_record_no * (rs as u64) < self.mft_valid_length;
+        Ok(keep_going)
+    }
+}
+
+pub fn consume_record(record_no: u64, record: &mut [u8], entries: &mut Vec<Entry>) {
+    if record.len() < 4 || &record[0..4] != b"FILE" {
+        return;
+    }
+    if !record_in_use(record) {
+        return;
+    }
+    if (record_no >= META_RECORDS || record_no == ROOT_RECORD)
+        && let Ok(entry) = extract_entry(record_no, record)
+    {
+        entries.push(entry);
+    }
+}
+
+/// Create a synthetic 1024-byte MFT record for testing and benchmarks.
+pub fn create_synthetic_record(
+    _record_no: u64,
+    parent_record: u64,
+    name: &str,
+    is_dir: bool,
+    real_size: u64,
+    allocated_size: u64,
+) -> Vec<u8> {
+    let mut rec = vec![0u8; 1024];
+    rec[0..4].copy_from_slice(b"FILE");
+    rec[0x14] = 0x40;
+    rec[0x15] = 0x00;
+    let flags: u16 = RECORD_FLAG_IN_USE | if is_dir { RECORD_FLAG_DIRECTORY } else { 0 };
+    rec[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+    rec[0x38..0x3A].copy_from_slice(&flags.to_le_bytes());
+
+    // USA pointer at 0x30..0x34: usa_offset = 0x28, usa_count = 3
+    rec[0x30] = 0x28;
+    rec[0x31] = 0x00;
+    rec[0x32] = 0x03;
+    rec[0x33] = 0x00;
+
+    let mut off = 0x40usize;
+
+    // Attr 1: $STANDARD_INFORMATION (0x10)
+    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+    let std_len = 0x48u32;
+    rec[off + 4..off + 8].copy_from_slice(&std_len.to_le_bytes());
+    rec[off + 8] = 0; // resident
+    rec[off + 0x10..off + 0x14].copy_from_slice(&0x30u32.to_le_bytes());
+    rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+    let mtime: i64 = 133500000000000000;
+    rec[off + 0x20..off + 0x28].copy_from_slice(&mtime.to_le_bytes());
+    off += std_len as usize;
+
+    // Attr 2: $FILE_NAME (0x30)
+    let name_utf16: Vec<u16> = name.encode_utf16().collect();
+    let name_units = name_utf16.len() as u8;
+    let name_bytes = name_units as usize * 2;
+    let body_len = 66 + name_bytes;
+    let fn_attr_len = (0x18 + body_len).next_multiple_of(8);
+    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_FILE_NAME.to_le_bytes());
+    rec[off + 4..off + 8].copy_from_slice(&(fn_attr_len as u32).to_le_bytes());
+    rec[off + 8] = 0;
+    rec[off + 0x10..off + 0x14].copy_from_slice(&(body_len as u32).to_le_bytes());
+    rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+    let fn_body = off + 0x18;
+    let parent_ref: u64 = parent_record | (1u64 << 48);
+    rec[fn_body..fn_body + 8].copy_from_slice(&parent_ref.to_le_bytes());
+    rec[fn_body + 64] = name_units;
+    rec[fn_body + 65] = 1; // Win32 namespace
+    for (i, u) in name_utf16.iter().enumerate() {
+        rec[fn_body + 66 + i * 2..fn_body + 68 + i * 2].copy_from_slice(&u.to_le_bytes());
+    }
+    off += fn_attr_len;
+
+    // Attr 3: $DATA (0x80)
+    if !is_dir {
+        if allocated_size == 0 && real_size <= 64 {
+            let data_attr_len = (0x18 + real_size as usize).next_multiple_of(8).max(0x20);
+            rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+            rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
+            rec[off + 8] = 0;
+            rec[off + 0x10..off + 0x14].copy_from_slice(&(real_size as u32).to_le_bytes());
+            rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            off += data_attr_len;
+        } else {
+            let runs_bytes = [0x11, 0x01, 0x10, 0x00];
+            let runs_off = 0x40u16;
+            let data_attr_len = (runs_off as usize + runs_bytes.len())
+                .next_multiple_of(8)
+                .max(0x48);
+            rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+            rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
+            rec[off + 8] = 1;
+            rec[off + 0x20..off + 0x22].copy_from_slice(&runs_off.to_le_bytes());
+            rec[off + 0x28..off + 0x30].copy_from_slice(&allocated_size.to_le_bytes());
+            rec[off + 0x30..off + 0x38].copy_from_slice(&real_size.to_le_bytes());
+            rec[off + 0x38..off + 0x40].copy_from_slice(&real_size.to_le_bytes());
+            rec[off + runs_off as usize..off + runs_off as usize + runs_bytes.len()]
+                .copy_from_slice(&runs_bytes);
+            off += data_attr_len;
+        }
+    }
+
+    if off + 4 <= 1024 {
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    }
+
+    rec[0x28] = 0x42;
+    rec[0x29] = 0x42;
+    rec[0x2A] = rec[510];
+    rec[0x2B] = rec[511];
+    rec[0x2C] = rec[1022];
+    rec[0x2D] = rec[1023];
+
+    rec[510] = 0x42;
+    rec[511] = 0x42;
+    rec[1022] = 0x42;
+    rec[1023] = 0x42;
+
+    rec
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     #[test]
@@ -717,14 +930,14 @@ mod tests {
 
     #[test]
     fn data_attrs_report_real_and_allocated_sizes() {
-        // Resident data of 100 bytes.
+        // Resident data of 100 bytes (allocated is 0 as data is in MFT record).
         let mut attr = vec![0u8; 0x20];
         attr[8] = 0; // resident
         attr[0x10] = 100;
         let d = parse_data_attr(&attr).unwrap();
         assert!(d.resident);
         assert_eq!(d.real_size, 100);
-        assert_eq!(d.allocated_size, 104);
+        assert_eq!(d.allocated_size, 0);
 
         // Non-resident with sizes and a run offset.
         let mut nr = vec![0u8; 0x40];
@@ -743,14 +956,222 @@ mod tests {
         bad[0x21] = 0xFF;
         assert_eq!(parse_data_attr(&bad).unwrap_err(), MftError::OutOfBounds);
     }
+
+    #[test]
+    fn sparse_file_allocated_below_logical() {
+        let logical = 100 * 1024 * 1024 * 1024u64; // 100 GiB
+        let allocated = 2 * 1024 * 1024 * 1024u64; // 2 GiB
+        let mut rec = create_synthetic_record(16, 5, "sparse.img", false, logical, allocated);
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.logical, logical);
+        assert_eq!(entry.allocated, allocated);
+        assert!(entry.allocated < entry.logical);
+    }
+
+    #[test]
+    fn compressed_file_allocation() {
+        let logical = 64 * 1024u64; // 64 KiB
+        let allocated = 32 * 1024u64; // 32 KiB
+        let mut rec = create_synthetic_record(17, 5, "compressed.bin", false, logical, allocated);
+        let entry = extract_entry(17, &mut rec).unwrap();
+        assert_eq!(entry.logical, logical);
+        assert_eq!(entry.allocated, allocated);
+        assert!(entry.allocated < entry.logical);
+    }
+
+    #[test]
+    fn zero_byte_and_resident_files() {
+        // Zero-byte file
+        let mut rec_zero = create_synthetic_record(18, 5, "empty.txt", false, 0, 0);
+        let entry_zero = extract_entry(18, &mut rec_zero).unwrap();
+        assert_eq!(entry_zero.logical, 0);
+        assert_eq!(entry_zero.allocated, 0);
+
+        // Resident data file
+        let mut rec_res = create_synthetic_record(19, 5, "tiny.txt", false, 42, 0);
+        let entry_res = extract_entry(19, &mut rec_res).unwrap();
+        assert_eq!(entry_res.logical, 42);
+        assert_eq!(entry_res.allocated, 0);
+    }
+
+    #[test]
+    fn records_split_across_read_boundaries() {
+        let cancel = AtomicBool::new(false);
+        let rec5 = create_synthetic_record(5, 5, "C:", true, 0, 0);
+        let rec16 = create_synthetic_record(16, 5, "file1.dat", false, 1000, 4096);
+        let rec17 = create_synthetic_record(17, 5, "file2.dat", false, 2000, 4096);
+        let rec18 = create_synthetic_record(18, 5, "file3.dat", false, 3000, 4096);
+
+        let mut stream = vec![0u8; 5 * 1024]; // 0..4 unused
+        stream.extend_from_slice(&rec5);
+        stream.extend_from_slice(&vec![0u8; 10 * 1024]); // 6..15 unused
+        stream.extend_from_slice(&rec16);
+        stream.extend_from_slice(&rec17);
+        stream.extend_from_slice(&rec18);
+
+        let total_valid = stream.len() as u64;
+
+        // Parse with single large chunk
+        let mut p_single = MftStreamParser::new(1024, total_valid);
+        let mut single_buf = stream.clone();
+        p_single.process_chunk(&mut single_buf, &cancel).unwrap();
+        let entries_single = p_single.into_entries();
+
+        // Parse with prime chunk sizes (333 bytes) crossing boundaries
+        let mut p_split = MftStreamParser::new(1024, total_valid);
+        let mut split_buf = stream.clone();
+        for chunk in split_buf.chunks_mut(333) {
+            p_split.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries_split = p_split.into_entries();
+
+        assert_eq!(entries_single.len(), 4);
+        assert_eq!(entries_split.len(), 4);
+        for (a, b) in entries_single.iter().zip(entries_split.iter()) {
+            assert_eq!(a.record_no, b.record_no);
+            assert_eq!(a.parent_record, b.parent_record);
+            assert_eq!(a.name_units, b.name_units);
+            assert_eq!(a.logical, b.logical);
+            assert_eq!(a.allocated, b.allocated);
+        }
+    }
+
+    #[test]
+    fn multiple_records_in_one_buffer() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        stream[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        for i in 16..26 {
+            stream.extend_from_slice(&create_synthetic_record(
+                i,
+                5,
+                &format!("file_{i}.txt"),
+                false,
+                i * 100,
+                4096,
+            ));
+        }
+
+        let mut parser = MftStreamParser::new(1024, stream.len() as u64);
+        parser.process_chunk(&mut stream, &cancel).unwrap();
+        assert_eq!(parser.entries().len(), 11);
+    }
+
+    #[test]
+    fn correct_record_numbers_across_chunks() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 30 * 1024];
+        let rec5 = create_synthetic_record(5, 5, "root", true, 0, 0);
+        let rec16 = create_synthetic_record(16, 5, "a.txt", false, 10, 4096);
+        let rec25 = create_synthetic_record(25, 5, "b.txt", false, 20, 4096);
+        stream[5 * 1024..6 * 1024].copy_from_slice(&rec5);
+        stream[16 * 1024..17 * 1024].copy_from_slice(&rec16);
+        stream[25 * 1024..26 * 1024].copy_from_slice(&rec25);
+
+        let mut parser = MftStreamParser::new(1024, stream.len() as u64);
+        for chunk in stream.chunks_mut(700) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+        assert_eq!(entries[2].record_no, 25);
+    }
+
+    #[test]
+    fn incomplete_final_records() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        stream[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        stream.extend_from_slice(&create_synthetic_record(
+            16, 5, "test.txt", false, 100, 4096,
+        ));
+        // Add 500 bytes trailing partial record
+        stream.extend_from_slice(&vec![0xAAu8; 500]);
+
+        let mut parser = MftStreamParser::new(1024, 18 * 1024);
+        parser.process_chunk(&mut stream, &cancel).unwrap();
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+    }
+
+    #[test]
+    fn cancellation_stops_processing() {
+        let cancel = AtomicBool::new(true);
+        let mut stream = create_synthetic_record(16, 5, "test.txt", false, 100, 4096);
+        let mut parser = MftStreamParser::new(1024, 1024);
+        let res = parser.process_chunk(&mut stream, &cancel);
+        assert_eq!(res.unwrap_err(), "cancelled");
+    }
+
+    #[test]
+    fn malformed_records_skipped_safely() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        // Record 16: Bad magic "BAAD"
+        let mut bad_magic = create_synthetic_record(16, 5, "bad1.txt", false, 100, 4096);
+        bad_magic[0..4].copy_from_slice(b"BAAD");
+        stream.extend_from_slice(&bad_magic);
+
+        // Record 17: Valid record
+        let good17 = create_synthetic_record(17, 5, "good17.txt", false, 100, 4096);
+        stream.extend_from_slice(&good17);
+
+        // Record 18: Fixup mismatch
+        let mut bad_fixup = create_synthetic_record(18, 5, "bad2.txt", false, 100, 4096);
+        bad_fixup[510] = 0x99;
+        stream.extend_from_slice(&bad_fixup);
+
+        // Record 19: Valid record
+        let good19 = create_synthetic_record(19, 5, "good19.txt", false, 200, 4096);
+        stream.extend_from_slice(&good19);
+
+        let mut parser = MftStreamParser::new(1024, 20 * 1024);
+        // Feed in 600-byte chunks to test split boundaries with malformed records
+        for chunk in stream.chunks_mut(600) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_no, 17);
+        assert_eq!(entries[1].record_no, 19);
+    }
+
+    #[test]
+    fn multiple_mft_extents() {
+        let cancel = AtomicBool::new(false);
+        // Extent 1 has records 0..20
+        let mut extent1 = vec![0u8; 20 * 1024];
+        extent1[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        extent1[16 * 1024..17 * 1024]
+            .copy_from_slice(&create_synthetic_record(16, 5, "e1.txt", false, 100, 4096));
+
+        // Extent 2 has records 20..30
+        let mut extent2 = vec![0u8; 10 * 1024];
+        extent2[2 * 1024..3 * 1024]
+            .copy_from_slice(&create_synthetic_record(22, 5, "e2.txt", false, 200, 4096));
+
+        let mut parser = MftStreamParser::new(1024, 30 * 1024);
+        for chunk in extent1.chunks_mut(1500) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        for chunk in extent2.chunks_mut(1500) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+        assert_eq!(entries[2].record_no, 22);
+    }
 }
 
-/// Volume access and MFT streaming (Windows only).
-///
-/// Everything above this point is pure parsing; this shell is the only
-/// part that touches raw volume handles. It requires administrator
-/// rights; any failure returns `Err` and the caller falls back to normal
-/// directory traversal.
 /// Volume access and MFT streaming (Windows only).
 ///
 /// Everything above this point is pure parsing; this shell is the only
@@ -770,8 +1191,8 @@ pub mod reader {
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use super::{
-        ATTR_TYPE_DATA, META_RECORDS, ROOT_RECORD, apply_fixups, attributes, build_model,
-        decode_runs, extract_entry, parse_data_attr,
+        ATTR_TYPE_DATA, MftStreamParser, apply_fixups, attributes, build_model, decode_runs,
+        parse_data_attr,
     };
     use crate::model::ScanModel;
 
@@ -950,9 +1371,8 @@ pub mod reader {
         let extents = mft_extents(handle, &vd)?;
         let rs = vd.bytes_per_record.max(128) as usize;
 
-        let mut entries: Vec<super::Entry> = Vec::with_capacity(64 * 1024);
-        let mut carry: Vec<u8> = Vec::new();
-        let mut next_record_no: u64 = 0;
+        let mut parser = MftStreamParser::new(rs, vd.mft_valid_length);
+        let mut chunk = vec![0u8; READ_CHUNK];
 
         for (lcn, clusters) in extents {
             let base = lcn
@@ -962,51 +1382,27 @@ pub mod reader {
                 .checked_mul(vd.bytes_per_cluster)
                 .ok_or("extent size overflows")?;
             seek_to(handle, base)?;
-            let mut chunk = vec![0u8; READ_CHUNK];
             let mut done: u64 = 0;
             while done < len {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
-                }
                 let take = (len - done).min(chunk.len() as u64) as usize;
                 read_exact(handle, &mut chunk[..take])?;
-                carry.extend_from_slice(&chunk[..take]);
                 done += take as u64;
 
-                // Consume whole records out of the carry buffer. Every MFT
-                // slot counts toward its record number even when skipped,
-                // because parent references are slot numbers.
-                while carry.len() >= rs {
-                    let mut record: Vec<u8> = carry.drain(..rs).collect();
-                    let record_no = next_record_no;
-                    next_record_no += 1;
-                    consume_record(record_no, &mut record, &mut entries);
-                }
-                if next_record_no * rs as u64 >= vd.mft_valid_length {
+                let keep_going = parser.process_chunk(&mut chunk[..take], cancel)?;
+                if !keep_going {
                     break;
                 }
             }
+            if parser.next_record_no() * (rs as u64) >= vd.mft_valid_length {
+                break;
+            }
         }
-        drop(carry);
 
+        let entries = parser.into_entries();
         let mut model =
             build_model(root, vd.serial, &entries).ok_or("MFT contains no root directory")?;
         model.free_space = Some(vd.free_clusters.saturating_mul(vd.bytes_per_cluster));
         Ok(model)
-    }
-
-    fn consume_record(record_no: u64, record: &mut [u8], entries: &mut Vec<super::Entry>) {
-        if record.len() < 4 || &record[0..4] != b"FILE" {
-            return;
-        }
-        if !super::record_in_use(record) {
-            return;
-        }
-        if (record_no >= META_RECORDS || record_no == ROOT_RECORD)
-            && let Ok(entry) = extract_entry(record_no, record)
-        {
-            entries.push(entry);
-        }
     }
 
     fn u32_at(buf: &[u8], off: usize) -> u32 {
