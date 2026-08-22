@@ -773,39 +773,50 @@ impl AppShell {
     }
 
     /// Treemap weights honor the active name filter like the table does.
-    fn treemap_inputs(&self) -> (Vec<TreemapItem>, u64, Option<u32>) {
-        let Some(model) = &self.model else {
-            return (Vec::new(), 0, None);
-        };
-        let m = model.read();
-        let Some(dir) = self.state.current_node else {
-            return (Vec::new(), 0, None);
-        };
-        let metric = self.state.metric;
-        let n = m.node(dir);
-        let dir_total = metric.pick(n.agg_logical, n.agg_allocated);
-        let filter = self.state.filter.to_lowercase();
-        let items: Vec<TreemapItem> = n
-            .children
-            .iter()
-            .filter(|&c| {
-                filter.is_empty()
-                    || m.node(*c)
-                        .name
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&filter)
-            })
-            .map(|&c| {
-                let cn = m.node(c);
-                TreemapItem {
-                    node_id: c.0,
-                    weight: metric.pick(cn.agg_logical, cn.agg_allocated) as f64,
-                }
-            })
-            .filter(|i| i.weight > 0.0)
-            .collect();
-        (items, dir_total, self.state.selected_node.map(|n| n.0))
+    /// Cached against `view_version`; render calls reuse the last build.
+    fn treemap_inputs(&mut self) -> (Vec<TreemapItem>, u64, Option<u32>) {
+        let selected = self.state.selected_node.map(|n| n.0);
+        if let Some((version, dir_total, items)) = &self.treemap_cache {
+            if *version == self.view_version {
+                return (items.clone(), *dir_total, selected);
+            }
+        }
+
+        let mut items: Vec<TreemapItem> = Vec::new();
+        let mut dir_total: u64 = 0;
+        if let Some(model) = &self.model {
+            let m = model.read();
+            if let Some(dir) = self.state.current_node {
+                let metric = self.state.metric;
+                let node = m.node(dir);
+                dir_total = metric.pick(node.agg_logical, node.agg_allocated);
+                // Same normalized-name matching as the table filter.
+                let filter = crate::search::normalize_query(&self.state.filter);
+                let matches = |name: &str| -> bool {
+                    if filter.is_empty() {
+                        return true;
+                    }
+                    let normalized = crate::search::normalize_query(name);
+                    normalized.windows(filter.len()).any(|w| w == filter)
+                };
+                items = node
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| matches(m.node(c).name.to_string_lossy().as_ref()))
+                    .map(|c| {
+                        let cn = m.node(c);
+                        TreemapItem {
+                            node_id: c.0,
+                            weight: metric.pick(cn.agg_logical, cn.agg_allocated) as f64,
+                        }
+                    })
+                    .filter(|i| i.weight > 0.0)
+                    .collect();
+            }
+        }
+        self.treemap_cache = Some((self.view_version, dir_total, items.clone()));
+        (items, dir_total, selected)
     }
 
     pub(super) fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
