@@ -112,6 +112,15 @@ impl ScannerBackend for WindowsFilesystem {
     }
 }
 
+/// `.` and `..` in UTF-16 code units.
+fn is_dot_entry(units: &[u16]) -> bool {
+    match units {
+        [0x2E] => true,
+        [0x2E, 0x2E] => true,
+        _ => false,
+    }
+}
+
 fn kind_of_attributes(attrs: u32) -> EntryKind {
     if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         // Symlinks and junctions are reparse points; both are described by
@@ -211,6 +220,12 @@ impl WindowsFilesystem {
                                 .iter()
                                 .map(|c| u16::from_le_bytes(*c)),
                         );
+                        // Some volumes hand back `.` and `..` even though
+                        // the API contract says they are excluded; either
+                        // would loop forever or escape the scan root.
+                        if is_dot_entry(&name_units) {
+                            continue;
+                        }
                         blob_parts.push(std::mem::take(&mut name_units));
                         meta.push(Some(record_to_md(&r, volume_serial)));
                     }
