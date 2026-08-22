@@ -214,9 +214,6 @@ impl WindowsFilesystem {
                     ));
                 }
             }
-            if chain_done {
-                break;
-            }
         }
 
         // SAFETY: created above, closed exactly once.
