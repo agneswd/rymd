@@ -844,6 +844,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn non_utf8_names_survive() {
         use std::os::unix::ffi::OsStrExt;
         let td = TempDir::new("nonutf8");
@@ -933,6 +934,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unreadable_directory_becomes_issue() {
         let td = TempDir::new("perm");
         let root = td.path();
