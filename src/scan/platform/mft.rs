@@ -39,7 +39,7 @@ pub enum MftError {
     MalformedAttribute,
 }
 
-const RECORD_HEADER_LEN: usize = 0x30;
+const RECORD_HEADER_MIN_LEN: usize = 0x18;
 const ATTR_HEADER_RESIDENT_LEN: usize = 0x18;
 
 pub const ATTR_TYPE_STANDARD_INFORMATION: u32 = 0x10;
@@ -47,32 +47,47 @@ pub const ATTR_TYPE_FILE_NAME: u32 = 0x30;
 pub const ATTR_TYPE_DATA: u32 = 0x80;
 pub const ATTR_TYPE_INDEX_ROOT: u32 = 0x90;
 
-/// Record flags (`u16` at offset 0x38).
+/// Record flags (`u16` at offset 0x16 in a FILE record header).
 pub const RECORD_FLAG_IN_USE: u16 = 0x0001;
 pub const RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 
 /// Apply the multi-sector header (update sequence array / fixups) in place.
 ///
+/// In a standard NTFS `MULTI_SECTOR_HEADER`:
+/// - 0x00..0x04: signature ("FILE")
+/// - 0x04..0x06: UpdateSequenceArrayOffset (USA offset)
+/// - 0x06..0x08: UpdateSequenceArraySize (USA count in 2-byte units)
+///
 /// Every 512-byte sector's trailing two bytes were replaced with a check
-/// value when the record hit disk; the originals live in the array right
-/// after the USN. Returns `FixupMismatch` if any sector tail disagrees,
-/// which is the classic signature of a torn or corrupted record.
+/// value (USN) when written to disk; the original bytes live in the USA
+/// array immediately following the USN. Returns `FixupMismatch` if any
+/// sector tail disagrees.
 pub fn apply_fixups(record: &mut [u8]) -> Result<(), MftError> {
-    if record.len() < RECORD_HEADER_LEN {
+    if record.len() < RECORD_HEADER_MIN_LEN {
         return Err(MftError::OutOfBounds);
     }
-    let usa_offset = u16_at(record, 0x30) as usize;
-    let usa_count = u16_at(record, 0x32) as usize;
-    // One USN (2 bytes) plus (count - 1) fixup pairs.
-    if usa_count == 0 || usa_offset + usa_count * 2 > record.len() {
+    let usa_offset = u16_at(record, 0x04) as usize;
+    let usa_count = u16_at(record, 0x06) as usize;
+    if usa_count == 0 {
         return Err(MftError::OutOfBounds);
     }
-    let usn = [record[usa_offset], record[usa_offset + 1]];
+    let usa_bytes = usa_count.checked_mul(2).ok_or(MftError::OutOfBounds)?;
+    if usa_offset
+        .checked_add(usa_bytes)
+        .is_none_or(|end| end > record.len())
+    {
+        return Err(MftError::OutOfBounds);
+    }
     let sector = 512usize;
     if !record.len().is_multiple_of(sector) {
         return Err(MftError::OutOfBounds);
     }
-    for i in 1..usa_count {
+    let sectors = record.len() / sector;
+    if usa_count < 1 + sectors {
+        return Err(MftError::OutOfBounds);
+    }
+    let usn = [record[usa_offset], record[usa_offset + 1]];
+    for i in 1..=sectors {
         let val_off = usa_offset + i * 2;
         // The fixup belongs at the end of the i-th 512-byte sector.
         let tail = i * sector - 2;
@@ -90,16 +105,20 @@ pub fn apply_fixups(record: &mut [u8]) -> Result<(), MftError> {
 
 /// Whether the record header claims this entry is present and valid.
 pub fn record_in_use(record: &[u8]) -> bool {
-    record.len() >= 0x3A && flags_of(record) & RECORD_FLAG_IN_USE != 0
+    record.len() >= RECORD_HEADER_MIN_LEN && flags_of(record) & RECORD_FLAG_IN_USE != 0
 }
 
 /// Whether the record describes a directory (from the header flags).
 pub fn record_is_directory(record: &[u8]) -> bool {
-    record.len() >= 0x3A && flags_of(record) & RECORD_FLAG_DIRECTORY != 0
+    record.len() >= RECORD_HEADER_MIN_LEN && flags_of(record) & RECORD_FLAG_DIRECTORY != 0
 }
 
-fn flags_of(record: &[u8]) -> u16 {
-    u16_at(record, 0x38)
+pub fn flags_of(record: &[u8]) -> u16 {
+    if record.len() >= RECORD_HEADER_MIN_LEN {
+        u16_at(record, 0x16)
+    } else {
+        0
+    }
 }
 
 /// Iterate raw attribute records inside an MFT record.
@@ -107,14 +126,14 @@ fn flags_of(record: &[u8]) -> u16 {
 /// Yields subslices; malformed lengths terminate the iteration instead of
 /// panicking or running past the buffer.
 pub fn attributes(record: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let start = if record.len() >= 0x20 {
+    let start = if record.len() >= RECORD_HEADER_MIN_LEN {
         u16_at(record, 0x14) as usize
     } else {
         0
     };
     let mut off = start;
     std::iter::from_fn(move || {
-        if off + 0x10 > record.len() {
+        if off < RECORD_HEADER_MIN_LEN || off + 8 > record.len() {
             return None;
         }
         let attr_type = u32_at(record, off);
@@ -129,6 +148,32 @@ pub fn attributes(record: &[u8]) -> impl Iterator<Item = &[u8]> {
         off += len;
         Some(attr)
     })
+}
+
+/// Extract the value slice from a resident attribute record.
+///
+/// Verifies that the attribute is resident (byte 0x08 == 0) and uses the
+/// recorded `ValueOffset` (0x14) and `ValueLength` (0x10) fields to return
+/// the exact value slice without assuming a hardcoded start offset.
+pub fn resident_value(attr: &[u8]) -> Result<&[u8], MftError> {
+    if attr.len() < ATTR_HEADER_RESIDENT_LEN {
+        return Err(MftError::OutOfBounds);
+    }
+    if attr[8] != 0 {
+        return Err(MftError::MalformedAttribute);
+    }
+    let val_len = u32_at(attr, 0x10) as usize;
+    let val_off = u16_at(attr, 0x14) as usize;
+    let end = val_off.checked_add(val_len).ok_or(MftError::OutOfBounds)?;
+    if end > attr.len() {
+        return Err(MftError::OutOfBounds);
+    }
+    Ok(&attr[val_off..end])
+}
+
+/// Whether an attribute is the unnamed default stream (name length at 0x09 is 0).
+pub fn attribute_is_unnamed(attr: &[u8]) -> bool {
+    attr.len() >= 0x0A && attr[9] == 0
 }
 
 /// A `$FILE_NAME` attribute body.
@@ -146,8 +191,7 @@ pub struct FileNameInfo {
     pub namespace: u8,
 }
 
-/// Parse a `$FILE_NAME` attribute body (the bytes after the resident
-/// attribute header).
+/// Parse a `$FILE_NAME` attribute body (the bytes of the resident value).
 pub fn parse_file_name(body: &[u8]) -> Result<FileNameInfo, MftError> {
     // Fixed part: parent(8) creation(8) modification(8) mft_mod(8)
     // access(8) allocated(8) real(8) flags(4) reparse_tag(4)
@@ -194,15 +238,11 @@ pub fn parse_data_attr(attr: &[u8]) -> Result<DataInfo, MftError> {
     }
     let non_resident = attr[8] != 0;
     if !non_resident {
-        // Resident: value_len @0x10, value_off @0x14.
-        if attr.len() < 0x16 {
-            return Err(MftError::OutOfBounds);
-        }
-        let value_len = u32_at(attr, 0x10) as u64;
+        let val = resident_value(attr)?;
         Ok(DataInfo {
             resident: true,
-            real_size: value_len,
-            allocated_size: value_len.next_multiple_of(8),
+            real_size: val.len() as u64,
+            allocated_size: 0,
             runs_offset: 0,
             runs_len: 0,
         })
@@ -448,34 +488,31 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
     for attr in attributes(record) {
         match u32_at(attr, 0) {
             ATTR_TYPE_STANDARD_INFORMATION => {
-                // Body starts after the resident header (0x10); the
-                // modification time sits at body offset 0x08.
-                if attr.len() >= 0x10 + 0x10 {
-                    let ft = i64_at(attr, 0x10 + 0x08);
+                if let Ok(body) = resident_value(attr)
+                    && body.len() >= 0x10
+                {
+                    let ft = i64_at(body, 0x08);
                     modified_ms = filetime_to_unix_ms(ft);
                 }
             }
             ATTR_TYPE_FILE_NAME => {
-                // Skip resident-header bytes to reach the attribute body.
-                let Some(body) = attr.get(0x10..) else {
-                    return Err(MftError::OutOfBounds);
-                };
-                let info = parse_file_name(body)?;
-                link_count += 1;
-                let better = match (best_name.as_ref().map(|n| n.namespace), info.namespace) {
-                    (_, 3) | (_, 1) => true,
-                    // DOS aliases and POSIX names lose against any Win32 name.
-                    (Some(1) | Some(3), _) => false,
-                    _ => true,
-                };
-                if better || best_name.is_none() {
-                    best_name = Some(info);
+                if let Ok(body) = resident_value(attr) {
+                    let info = parse_file_name(body)?;
+                    link_count += 1;
+                    let better = match (best_name.as_ref().map(|n| n.namespace), info.namespace) {
+                        (_, 3) | (_, 1) => true,
+                        // DOS aliases and POSIX names lose against any Win32 name.
+                        (Some(1) | Some(3), _) => false,
+                        _ => true,
+                    };
+                    if better || best_name.is_none() {
+                        best_name = Some(info);
+                    }
                 }
             }
             ATTR_TYPE_DATA => {
                 // Only the unnamed stream is the file's content.
-                let has_name = attr[6] != 0;
-                if !has_name && data.is_none() {
+                if attribute_is_unnamed(attr) && data.is_none() {
                     data = Some(parse_data_attr(attr)?);
                 }
             }
@@ -496,15 +533,15 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
         // few attributes) so we borrow from `record`, not a stale slice.
         let mut found: Option<Vec<u16>> = None;
         for attr in attributes(record) {
-            if u32_at(attr, 0) != ATTR_TYPE_FILE_NAME || attr.len() < 0x10 {
+            if u32_at(attr, 0) != ATTR_TYPE_FILE_NAME {
                 continue;
             }
-            if let Ok(info) = parse_file_name(&attr[0x10..])
+            if let Ok(body) = resident_value(attr)
+                && let Ok(info) = parse_file_name(body)
                 && info.name_units == name_info.name_units
                 && info.namespace == name_info.namespace
                 && info.parent_record == name_info.parent_record
             {
-                let body = &attr[0x10..];
                 let start = info.name_offset;
                 let end = start + info.name_units as usize * 2;
                 found = body.get(start..end).map(|raw| {
@@ -527,7 +564,7 @@ pub fn extract_entry(record_no: u64, record: &mut [u8]) -> Result<Entry, MftErro
         )
     } else {
         match data {
-            Some(d) => (d.real_size, d.allocated_size.max(d.real_size)),
+            Some(d) => (d.real_size, d.allocated_size),
             None => (0, 0),
         }
     };
@@ -562,8 +599,236 @@ fn u16_at(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
+/// Streaming parser for MFT records across arbitrary chunk buffers.
+///
+/// Processes complete records in-place without copying or shifting buffer
+/// memory. Maintains carry only for partial records spanning chunk boundaries.
+pub struct MftStreamParser {
+    record_size: usize,
+    mft_valid_length: u64,
+    next_record_no: u64,
+    carry: Vec<u8>,
+    entries: Vec<Entry>,
+}
+
+impl MftStreamParser {
+    pub fn new(record_size: usize, mft_valid_length: u64) -> Self {
+        let rs = record_size.max(128);
+        Self {
+            record_size: rs,
+            mft_valid_length,
+            next_record_no: 0,
+            carry: Vec::with_capacity(rs),
+            entries: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<Entry> {
+        self.entries
+    }
+
+    pub fn next_record_no(&self) -> u64 {
+        self.next_record_no
+    }
+
+    /// Process a mutable chunk of MFT bytes.
+    ///
+    /// Fixups and attribute parsing happen in place within `chunk`.
+    /// Returns `Err("cancelled")` if `cancel` is set.
+    pub fn process_chunk(
+        &mut self,
+        mut chunk: &mut [u8],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, String> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let rs = self.record_size;
+
+        // If we have leftover bytes from a previous chunk, complete the record first.
+        if !self.carry.is_empty() {
+            let need = rs - self.carry.len();
+            if chunk.len() < need {
+                self.carry.extend_from_slice(chunk);
+                return Ok(true);
+            }
+            let (head, rest) = chunk.split_at_mut(need);
+            self.carry.extend_from_slice(head);
+            let record_no = self.next_record_no;
+            self.next_record_no += 1;
+            consume_record(record_no, &mut self.carry, &mut self.entries);
+            self.carry.clear();
+            chunk = rest;
+        }
+
+        // Process full records directly from `chunk` using in-place slices.
+        let mut chunks = chunk.chunks_exact_mut(rs);
+        for record_slice in &mut chunks {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            if self.next_record_no * (rs as u64) >= self.mft_valid_length {
+                return Ok(false);
+            }
+            let record_no = self.next_record_no;
+            self.next_record_no += 1;
+            consume_record(record_no, record_slice, &mut self.entries);
+        }
+
+        // Preserve trailing incomplete record as carry for next chunk.
+        let remainder = chunks.into_remainder();
+        if !remainder.is_empty() && self.next_record_no * (rs as u64) < self.mft_valid_length {
+            self.carry.extend_from_slice(remainder);
+        }
+
+        let keep_going = self.next_record_no * (rs as u64) < self.mft_valid_length;
+        Ok(keep_going)
+    }
+}
+
+pub fn consume_record(record_no: u64, record: &mut [u8], entries: &mut Vec<Entry>) {
+    if record.len() < 4 || &record[0..4] != b"FILE" {
+        return;
+    }
+    if !record_in_use(record) {
+        return;
+    }
+    if (record_no >= META_RECORDS || record_no == ROOT_RECORD)
+        && let Ok(entry) = extract_entry(record_no, record)
+    {
+        entries.push(entry);
+    }
+}
+
+/// Create a synthetic 1024-byte MFT record for testing and benchmarks.
+///
+/// Follows standard Microsoft NTFS on-disk layouts:
+/// - 0x00..0x04: "FILE"
+/// - 0x04..0x06: UpdateSequenceArrayOffset = 0x30
+/// - 0x06..0x08: UpdateSequenceArraySize = 3 (1 USN + 2 sector fixup entries)
+/// - 0x14..0x16: FirstAttributeOffset = 0x38
+/// - 0x16..0x18: Flags (IN_USE | DIRECTORY)
+/// - 0x30..0x36: USA array
+/// - 0x38..: Attributes ($STANDARD_INFORMATION, $FILE_NAME, $DATA)
+pub fn create_synthetic_record(
+    _record_no: u64,
+    parent_record: u64,
+    name: &str,
+    is_dir: bool,
+    real_size: u64,
+    allocated_size: u64,
+) -> Vec<u8> {
+    let mut rec = vec![0u8; 1024];
+    rec[0..4].copy_from_slice(b"FILE");
+    // USA offset at 0x04: 0x30, USA count at 0x06: 3
+    rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+    rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+    // First attribute offset at 0x14: 0x38
+    rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+    // Flags at 0x16
+    let flags: u16 = RECORD_FLAG_IN_USE | if is_dir { RECORD_FLAG_DIRECTORY } else { 0 };
+    rec[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+
+    let mut off = 0x38usize;
+
+    // Attr 1: $STANDARD_INFORMATION (0x10)
+    let std_val_len = 0x30u32;
+    let std_val_off = 0x18u16;
+    let std_len = 0x48u32;
+    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+    rec[off + 4..off + 8].copy_from_slice(&std_len.to_le_bytes());
+    rec[off + 8] = 0; // resident
+    rec[off + 9] = 0; // unnamed
+    rec[off + 0x10..off + 0x14].copy_from_slice(&std_val_len.to_le_bytes());
+    rec[off + 0x14..off + 0x16].copy_from_slice(&std_val_off.to_le_bytes());
+    let std_val_start = off + std_val_off as usize;
+    let mtime: i64 = 133500000000000000;
+    rec[std_val_start + 0x08..std_val_start + 0x10].copy_from_slice(&mtime.to_le_bytes());
+    off += std_len as usize;
+
+    // Attr 2: $FILE_NAME (0x30)
+    let name_utf16: Vec<u16> = name.encode_utf16().collect();
+    let name_units = name_utf16.len() as u8;
+    let name_bytes = name_units as usize * 2;
+    let body_len = 66 + name_bytes;
+    let fn_val_off = 0x18u16;
+    let fn_attr_len = (0x18 + body_len).next_multiple_of(8);
+    rec[off..off + 4].copy_from_slice(&ATTR_TYPE_FILE_NAME.to_le_bytes());
+    rec[off + 4..off + 8].copy_from_slice(&(fn_attr_len as u32).to_le_bytes());
+    rec[off + 8] = 0; // resident
+    rec[off + 9] = 0; // unnamed
+    rec[off + 0x10..off + 0x14].copy_from_slice(&(body_len as u32).to_le_bytes());
+    rec[off + 0x14..off + 0x16].copy_from_slice(&fn_val_off.to_le_bytes());
+    let fn_body = off + fn_val_off as usize;
+    let parent_ref: u64 = parent_record | (1u64 << 48);
+    rec[fn_body..fn_body + 8].copy_from_slice(&parent_ref.to_le_bytes());
+    rec[fn_body + 64] = name_units;
+    rec[fn_body + 65] = 1; // Win32 namespace
+    for (i, u) in name_utf16.iter().enumerate() {
+        rec[fn_body + 66 + i * 2..fn_body + 68 + i * 2].copy_from_slice(&u.to_le_bytes());
+    }
+    off += fn_attr_len;
+
+    // Attr 3: $DATA (0x80)
+    if !is_dir {
+        if allocated_size == 0 && real_size <= 64 {
+            let data_attr_len = (0x18 + real_size as usize).next_multiple_of(8).max(0x20);
+            rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+            rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
+            rec[off + 8] = 0; // resident
+            rec[off + 9] = 0; // unnamed
+            rec[off + 0x10..off + 0x14].copy_from_slice(&(real_size as u32).to_le_bytes());
+            rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            off += data_attr_len;
+        } else {
+            let runs_bytes = [0x11, 0x01, 0x10, 0x00];
+            let runs_off = 0x40u16;
+            let data_attr_len = (runs_off as usize + runs_bytes.len())
+                .next_multiple_of(8)
+                .max(0x48);
+            rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+            rec[off + 4..off + 8].copy_from_slice(&(data_attr_len as u32).to_le_bytes());
+            rec[off + 8] = 1; // non-resident
+            rec[off + 9] = 0; // unnamed
+            rec[off + 0x20..off + 0x22].copy_from_slice(&runs_off.to_le_bytes());
+            rec[off + 0x28..off + 0x30].copy_from_slice(&allocated_size.to_le_bytes());
+            rec[off + 0x30..off + 0x38].copy_from_slice(&real_size.to_le_bytes());
+            rec[off + 0x38..off + 0x40].copy_from_slice(&real_size.to_le_bytes());
+            rec[off + runs_off as usize..off + runs_off as usize + runs_bytes.len()]
+                .copy_from_slice(&runs_bytes);
+            off += data_attr_len;
+        }
+    }
+
+    if off + 4 <= 1024 {
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    }
+
+    // USA array at 0x30..0x36: USN [0x42, 0x42]
+    rec[0x30] = 0x42;
+    rec[0x31] = 0x42;
+    rec[0x32] = rec[510];
+    rec[0x33] = rec[511];
+    rec[0x34] = rec[1022];
+    rec[0x35] = rec[1023];
+
+    rec[510] = 0x42;
+    rec[511] = 0x42;
+    rec[1022] = 0x42;
+    rec[1023] = 0x42;
+
+    rec
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     #[test]
@@ -571,11 +836,9 @@ mod tests {
         // Two-sector record with one fixup pair.
         let mut rec = vec![0u8; 1024];
         rec[0..4].copy_from_slice(b"FILE");
-        // USA at 0x30, count 3 => USN + 2 pairs.
-        rec[0x30] = 0x28;
-        rec[0x31] = 0x00;
-        rec[0x32] = 0x03;
-        rec[0x33] = 0x00;
+        // USA pointer at 0x04 (offset 0x28), USA count at 0x06 (count 3 => USN + 2 sectors).
+        rec[0x04..0x06].copy_from_slice(&0x28u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
         // USN value 0xABCD.
         rec[0x28] = 0xCD;
         rec[0x29] = 0xAB;
@@ -602,12 +865,316 @@ mod tests {
     }
 
     #[test]
+    fn usa_offsets_and_flags_at_spec_locations_not_legacy_offsets() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        // Real USA header fields at 0x04 and 0x06
+        rec[0x04..0x06].copy_from_slice(&0x28u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        // Real flags at 0x16
+        rec[0x16..0x18]
+            .copy_from_slice(&(RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).to_le_bytes());
+
+        // Bogus values at wrong legacy locations (0x30/0x32/0x38)
+        rec[0x30..0x32].copy_from_slice(&0xDEADu16.to_le_bytes());
+        rec[0x32..0x34].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&0xCAFEu16.to_le_bytes());
+
+        // Set up USN at real USA location (0x28)
+        rec[0x28] = 0x42;
+        rec[0x29] = 0x42;
+        rec[0x2A] = 0x11;
+        rec[0x2B] = 0x22;
+        rec[0x2C] = 0x33;
+        rec[0x2D] = 0x44;
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        assert!(apply_fixups(&mut rec).is_ok());
+        assert!(record_in_use(&rec));
+        assert!(record_is_directory(&rec));
+    }
+
+    #[test]
+    fn flags_only_read_from_0x16() {
+        let mut rec = vec![0u8; 512];
+        // Flags at 0x16 is 0, bogus flag at 0x38 is IN_USE
+        rec[0x16..0x18].copy_from_slice(&0u16.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+        assert!(!record_in_use(&rec));
+
+        // Now set real flags at 0x16
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+        rec[0x38..0x3A].copy_from_slice(&0u16.to_le_bytes());
+        assert!(record_in_use(&rec));
+        assert!(!record_is_directory(&rec));
+
+        rec[0x16..0x18]
+            .copy_from_slice(&(RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).to_le_bytes());
+        assert!(record_is_directory(&rec));
+    }
+
+    #[test]
+    fn resident_value_offset_resolution() {
+        // Standard attribute with ValueOffset = 0x18
+        let mut attr_std = vec![0u8; 0x28];
+        attr_std[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr_std[4..8].copy_from_slice(&0x28u32.to_le_bytes());
+        attr_std[8] = 0; // resident
+        attr_std[0x10..0x14].copy_from_slice(&10u32.to_le_bytes()); // ValueLength = 10
+        attr_std[0x14..0x16].copy_from_slice(&0x18u16.to_le_bytes()); // ValueOffset = 0x18
+        attr_std[0x18..0x22].copy_from_slice(b"0123456789");
+        let val = resident_value(&attr_std).unwrap();
+        assert_eq!(val, b"0123456789");
+
+        // Custom attribute with non-default ValueOffset = 0x20
+        let mut attr_custom = vec![0u8; 0x30];
+        attr_custom[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr_custom[4..8].copy_from_slice(&0x30u32.to_le_bytes());
+        attr_custom[8] = 0; // resident
+        attr_custom[0x10..0x14].copy_from_slice(&8u32.to_le_bytes()); // ValueLength = 8
+        attr_custom[0x14..0x16].copy_from_slice(&0x20u16.to_le_bytes()); // ValueOffset = 0x20
+        attr_custom[0x20..0x28].copy_from_slice(b"abcdefgh");
+        let val = resident_value(&attr_custom).unwrap();
+        assert_eq!(val, b"abcdefgh");
+
+        // Out-of-bounds ValueOffset
+        let mut bad_off = attr_std.clone();
+        bad_off[0x14..0x16].copy_from_slice(&0x50u16.to_le_bytes());
+        assert_eq!(resident_value(&bad_off).unwrap_err(), MftError::OutOfBounds);
+
+        // Out-of-bounds ValueLength
+        let mut bad_len = attr_std.clone();
+        bad_len[0x10..0x14].copy_from_slice(&500u32.to_le_bytes());
+        assert_eq!(resident_value(&bad_len).unwrap_err(), MftError::OutOfBounds);
+
+        // Non-resident attribute passed to resident_value
+        let mut non_res = attr_std.clone();
+        non_res[8] = 1;
+        assert_eq!(
+            resident_value(&non_res).unwrap_err(),
+            MftError::MalformedAttribute
+        );
+    }
+
+    #[test]
+    fn standard_information_timestamp_from_value_offset() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+
+        // Attr 1: $STANDARD_INFORMATION with non-default ValueOffset = 0x20
+        let mut off = 0x38usize;
+        let std_val_len = 0x30u32;
+        let std_val_off = 0x20u16;
+        let std_len = 0x50u32;
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&std_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 0x10..off + 0x14].copy_from_slice(&std_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&std_val_off.to_le_bytes());
+        let mtime: i64 = 133500000000000000;
+        let std_val_start = off + std_val_off as usize;
+        rec[std_val_start + 0x08..std_val_start + 0x10].copy_from_slice(&mtime.to_le_bytes());
+        off += std_len as usize;
+
+        // Attr 2: $FILE_NAME
+        let fn_attr = {
+            let fn_rec = create_synthetic_record(16, 5, "test.txt", false, 100, 4096);
+            attributes(&fn_rec).nth(1).unwrap().to_vec()
+        };
+        rec[off..off + fn_attr.len()].copy_from_slice(&fn_attr);
+        off += fn_attr.len();
+
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Set up USN fixups
+        rec[0x30] = 0x42;
+        rec[0x31] = 0x42;
+        rec[0x32] = rec[510];
+        rec[0x33] = rec[511];
+        rec[0x34] = rec[1022];
+        rec[0x35] = rec[1023];
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.modified_ms, filetime_to_unix_ms(mtime));
+    }
+
+    #[test]
+    fn named_alternate_data_stream_ignored() {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes());
+
+        let mut off = 0x38usize;
+
+        // $STANDARD_INFORMATION
+        let std_attr = attributes(&create_synthetic_record(16, 5, "a", false, 0, 0))
+            .next()
+            .unwrap()
+            .to_vec();
+        rec[off..off + std_attr.len()].copy_from_slice(&std_attr);
+        off += std_attr.len();
+
+        // $FILE_NAME
+        let fn_attr = attributes(&create_synthetic_record(16, 5, "file.txt", false, 0, 0))
+            .nth(1)
+            .unwrap()
+            .to_vec();
+        rec[off..off + fn_attr.len()].copy_from_slice(&fn_attr);
+        off += fn_attr.len();
+
+        // Named $DATA stream (ADS $DATA:Zone.Identifier)
+        let ads_val_len = 20u32;
+        let ads_len = (0x18 + ads_val_len).next_multiple_of(8);
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&ads_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 9] = 4; // name_length = 4 (named stream!)
+        rec[off + 0x10..off + 0x14].copy_from_slice(&ads_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += ads_len as usize;
+
+        // Unnamed primary $DATA stream
+        let primary_val_len = 50u32;
+        let primary_len = (0x18 + primary_val_len).next_multiple_of(8);
+        rec[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        rec[off + 4..off + 8].copy_from_slice(&primary_len.to_le_bytes());
+        rec[off + 8] = 0; // resident
+        rec[off + 9] = 0; // name_length = 0 (unnamed stream!)
+        rec[off + 0x10..off + 0x14].copy_from_slice(&primary_val_len.to_le_bytes());
+        rec[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += primary_len as usize;
+
+        rec[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Fixups
+        rec[0x30] = 0x42;
+        rec[0x31] = 0x42;
+        rec[0x32] = rec[510];
+        rec[0x33] = rec[511];
+        rec[0x34] = rec[1022];
+        rec[0x35] = rec[1023];
+        rec[510] = 0x42;
+        rec[511] = 0x42;
+        rec[1022] = 0x42;
+        rec[1023] = 0x42;
+
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.logical, 50);
+    }
+
+    #[test]
+    fn realistic_file_record_fixture() {
+        // Byte fixture representing a spec-correct NTFS FILE record for "notes.txt":
+        // - Magic "FILE"
+        // - USA offset at 0x04 = 0x30, USA count at 0x06 = 3
+        // - First attribute offset at 0x14 = 0x38
+        // - Flags at 0x16 = 0x0001 (IN_USE)
+        // - Attributes: $STANDARD_INFORMATION at 0x38, $FILE_NAME at 0x80, $DATA at 0xFA
+        let mut fixture = vec![0u8; 1024];
+        fixture[0x00..0x04].copy_from_slice(b"FILE");
+        fixture[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        fixture[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        fixture[0x08..0x10].copy_from_slice(&0x12345678u64.to_le_bytes()); // LSN
+        fixture[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // Seq
+        fixture[0x12..0x14].copy_from_slice(&1u16.to_le_bytes()); // HardLinkCount
+        fixture[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes()); // FirstAttr
+        fixture[0x16..0x18].copy_from_slice(&RECORD_FLAG_IN_USE.to_le_bytes()); // Flags
+
+        // USA at 0x30..0x36
+        fixture[0x30..0x32].copy_from_slice(&[0x99, 0x88]); // USN
+        fixture[0x32..0x34].copy_from_slice(&[0x11, 0x22]); // Sector 1 tail
+        fixture[0x34..0x36].copy_from_slice(&[0x33, 0x44]); // Sector 2 tail
+
+        // Attr 1: $STANDARD_INFORMATION at 0x38 (len 0x48)
+        let mut off = 0x38usize;
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_STANDARD_INFORMATION.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&0x48u32.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&0x30u32.to_le_bytes()); // ValueLength
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes()); // ValueOffset
+        let mtime: i64 = 133500000000000000;
+        fixture[off + 0x18 + 0x08..off + 0x18 + 0x10].copy_from_slice(&mtime.to_le_bytes());
+        off += 0x48;
+
+        // Attr 2: $FILE_NAME at 0x80 (len 0x78)
+        let name = "notes.txt";
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        let body_len = (66 + name_u16.len() * 2) as u32;
+        let fn_attr_len = (0x18 + body_len).next_multiple_of(8);
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_FILE_NAME.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&fn_attr_len.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&body_len.to_le_bytes());
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        let val_start = off + 0x18;
+        let parent_ref = 5u64 | (1u64 << 48); // parent 5, seq 1
+        fixture[val_start..val_start + 8].copy_from_slice(&parent_ref.to_le_bytes());
+        fixture[val_start + 64] = name_u16.len() as u8;
+        fixture[val_start + 65] = 1; // Win32
+        for (i, u) in name_u16.iter().enumerate() {
+            fixture[val_start + 66 + i * 2..val_start + 68 + i * 2]
+                .copy_from_slice(&u.to_le_bytes());
+        }
+        off += fn_attr_len as usize;
+
+        // Attr 3: $DATA at off (len 0x28, resident content b"Hello, World!")
+        let content = b"Hello, World!";
+        let data_len = (0x18 + content.len()).next_multiple_of(8) as u32;
+        fixture[off..off + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        fixture[off + 4..off + 8].copy_from_slice(&data_len.to_le_bytes());
+        fixture[off + 8] = 0; // resident
+        fixture[off + 9] = 0; // unnamed
+        fixture[off + 0x10..off + 0x14].copy_from_slice(&(content.len() as u32).to_le_bytes());
+        fixture[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        fixture[off + 0x18..off + 0x18 + content.len()].copy_from_slice(content);
+        off += data_len as usize;
+
+        // End marker
+        fixture[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+        // Sector tails with USN check values
+        fixture[510] = 0x99;
+        fixture[511] = 0x88;
+        fixture[1022] = 0x99;
+        fixture[1023] = 0x88;
+
+        let entry = extract_entry(42, &mut fixture).unwrap();
+        assert_eq!(entry.record_no, 42);
+        assert_eq!(entry.parent_record, Some(5));
+        assert_eq!(String::from_utf16_lossy(&entry.name_units), "notes.txt");
+        assert!(!entry.is_directory);
+        assert_eq!(entry.logical, 13);
+        assert_eq!(entry.allocated, 0);
+        assert_eq!(entry.modified_ms, filetime_to_unix_ms(mtime));
+
+        // Verify fixup restored the original sector tail bytes
+        assert_eq!(fixture[510..512], [0x11, 0x22]);
+        assert_eq!(fixture[1022..1024], [0x33, 0x44]);
+    }
+
+    #[test]
     fn truncated_fixup_array_is_out_of_bounds() {
         let mut rec = vec![0u8; 512];
-        rec[0x30] = 0xFF;
-        rec[0x31] = 0xFF; // USA offset beyond record
-        rec[0x32] = 0x05;
-        rec[0x33] = 0x00;
+        rec[0x04] = 0xFF;
+        rec[0x05] = 0xFF; // USA offset beyond record
+        rec[0x06] = 0x05;
+        rec[0x07] = 0x00;
         assert_eq!(apply_fixups(&mut rec).unwrap_err(), MftError::OutOfBounds);
     }
 
@@ -717,14 +1284,17 @@ mod tests {
 
     #[test]
     fn data_attrs_report_real_and_allocated_sizes() {
-        // Resident data of 100 bytes.
-        let mut attr = vec![0u8; 0x20];
+        // Resident data of 100 bytes (allocated is 0 as data is in MFT record).
+        let mut attr = vec![0u8; 0x20 + 100];
+        attr[0..4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        attr[4..8].copy_from_slice(&((0x18 + 100) as u32).to_le_bytes());
         attr[8] = 0; // resident
-        attr[0x10] = 100;
+        attr[0x10..0x14].copy_from_slice(&100u32.to_le_bytes());
+        attr[0x14..0x16].copy_from_slice(&0x18u16.to_le_bytes());
         let d = parse_data_attr(&attr).unwrap();
         assert!(d.resident);
         assert_eq!(d.real_size, 100);
-        assert_eq!(d.allocated_size, 104);
+        assert_eq!(d.allocated_size, 0);
 
         // Non-resident with sizes and a run offset.
         let mut nr = vec![0u8; 0x40];
@@ -743,14 +1313,222 @@ mod tests {
         bad[0x21] = 0xFF;
         assert_eq!(parse_data_attr(&bad).unwrap_err(), MftError::OutOfBounds);
     }
+
+    #[test]
+    fn sparse_file_allocated_below_logical() {
+        let logical = 100 * 1024 * 1024 * 1024u64; // 100 GiB
+        let allocated = 2 * 1024 * 1024 * 1024u64; // 2 GiB
+        let mut rec = create_synthetic_record(16, 5, "sparse.img", false, logical, allocated);
+        let entry = extract_entry(16, &mut rec).unwrap();
+        assert_eq!(entry.logical, logical);
+        assert_eq!(entry.allocated, allocated);
+        assert!(entry.allocated < entry.logical);
+    }
+
+    #[test]
+    fn compressed_file_allocation() {
+        let logical = 64 * 1024u64; // 64 KiB
+        let allocated = 32 * 1024u64; // 32 KiB
+        let mut rec = create_synthetic_record(17, 5, "compressed.bin", false, logical, allocated);
+        let entry = extract_entry(17, &mut rec).unwrap();
+        assert_eq!(entry.logical, logical);
+        assert_eq!(entry.allocated, allocated);
+        assert!(entry.allocated < entry.logical);
+    }
+
+    #[test]
+    fn zero_byte_and_resident_files() {
+        // Zero-byte file
+        let mut rec_zero = create_synthetic_record(18, 5, "empty.txt", false, 0, 0);
+        let entry_zero = extract_entry(18, &mut rec_zero).unwrap();
+        assert_eq!(entry_zero.logical, 0);
+        assert_eq!(entry_zero.allocated, 0);
+
+        // Resident data file
+        let mut rec_res = create_synthetic_record(19, 5, "tiny.txt", false, 42, 0);
+        let entry_res = extract_entry(19, &mut rec_res).unwrap();
+        assert_eq!(entry_res.logical, 42);
+        assert_eq!(entry_res.allocated, 0);
+    }
+
+    #[test]
+    fn records_split_across_read_boundaries() {
+        let cancel = AtomicBool::new(false);
+        let rec5 = create_synthetic_record(5, 5, "C:", true, 0, 0);
+        let rec16 = create_synthetic_record(16, 5, "file1.dat", false, 1000, 4096);
+        let rec17 = create_synthetic_record(17, 5, "file2.dat", false, 2000, 4096);
+        let rec18 = create_synthetic_record(18, 5, "file3.dat", false, 3000, 4096);
+
+        let mut stream = vec![0u8; 5 * 1024]; // 0..4 unused
+        stream.extend_from_slice(&rec5);
+        stream.extend_from_slice(&vec![0u8; 10 * 1024]); // 6..15 unused
+        stream.extend_from_slice(&rec16);
+        stream.extend_from_slice(&rec17);
+        stream.extend_from_slice(&rec18);
+
+        let total_valid = stream.len() as u64;
+
+        // Parse with single large chunk
+        let mut p_single = MftStreamParser::new(1024, total_valid);
+        let mut single_buf = stream.clone();
+        p_single.process_chunk(&mut single_buf, &cancel).unwrap();
+        let entries_single = p_single.into_entries();
+
+        // Parse with prime chunk sizes (333 bytes) crossing boundaries
+        let mut p_split = MftStreamParser::new(1024, total_valid);
+        let mut split_buf = stream.clone();
+        for chunk in split_buf.chunks_mut(333) {
+            p_split.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries_split = p_split.into_entries();
+
+        assert_eq!(entries_single.len(), 4);
+        assert_eq!(entries_split.len(), 4);
+        for (a, b) in entries_single.iter().zip(entries_split.iter()) {
+            assert_eq!(a.record_no, b.record_no);
+            assert_eq!(a.parent_record, b.parent_record);
+            assert_eq!(a.name_units, b.name_units);
+            assert_eq!(a.logical, b.logical);
+            assert_eq!(a.allocated, b.allocated);
+        }
+    }
+
+    #[test]
+    fn multiple_records_in_one_buffer() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        stream[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        for i in 16..26 {
+            stream.extend_from_slice(&create_synthetic_record(
+                i,
+                5,
+                &format!("file_{i}.txt"),
+                false,
+                i * 100,
+                4096,
+            ));
+        }
+
+        let mut parser = MftStreamParser::new(1024, stream.len() as u64);
+        parser.process_chunk(&mut stream, &cancel).unwrap();
+        assert_eq!(parser.entries().len(), 11);
+    }
+
+    #[test]
+    fn correct_record_numbers_across_chunks() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 30 * 1024];
+        let rec5 = create_synthetic_record(5, 5, "root", true, 0, 0);
+        let rec16 = create_synthetic_record(16, 5, "a.txt", false, 10, 4096);
+        let rec25 = create_synthetic_record(25, 5, "b.txt", false, 20, 4096);
+        stream[5 * 1024..6 * 1024].copy_from_slice(&rec5);
+        stream[16 * 1024..17 * 1024].copy_from_slice(&rec16);
+        stream[25 * 1024..26 * 1024].copy_from_slice(&rec25);
+
+        let mut parser = MftStreamParser::new(1024, stream.len() as u64);
+        for chunk in stream.chunks_mut(700) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+        assert_eq!(entries[2].record_no, 25);
+    }
+
+    #[test]
+    fn incomplete_final_records() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        stream[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        stream.extend_from_slice(&create_synthetic_record(
+            16, 5, "test.txt", false, 100, 4096,
+        ));
+        // Add 500 bytes trailing partial record
+        stream.extend_from_slice(&vec![0xAAu8; 500]);
+
+        let mut parser = MftStreamParser::new(1024, 18 * 1024);
+        parser.process_chunk(&mut stream, &cancel).unwrap();
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+    }
+
+    #[test]
+    fn cancellation_stops_processing() {
+        let cancel = AtomicBool::new(true);
+        let mut stream = create_synthetic_record(16, 5, "test.txt", false, 100, 4096);
+        let mut parser = MftStreamParser::new(1024, 1024);
+        let res = parser.process_chunk(&mut stream, &cancel);
+        assert_eq!(res.unwrap_err(), "cancelled");
+    }
+
+    #[test]
+    fn malformed_records_skipped_safely() {
+        let cancel = AtomicBool::new(false);
+        let mut stream = vec![0u8; 16 * 1024];
+        // Record 16: Bad magic "BAAD"
+        let mut bad_magic = create_synthetic_record(16, 5, "bad1.txt", false, 100, 4096);
+        bad_magic[0..4].copy_from_slice(b"BAAD");
+        stream.extend_from_slice(&bad_magic);
+
+        // Record 17: Valid record
+        let good17 = create_synthetic_record(17, 5, "good17.txt", false, 100, 4096);
+        stream.extend_from_slice(&good17);
+
+        // Record 18: Fixup mismatch
+        let mut bad_fixup = create_synthetic_record(18, 5, "bad2.txt", false, 100, 4096);
+        bad_fixup[510] = 0x99;
+        stream.extend_from_slice(&bad_fixup);
+
+        // Record 19: Valid record
+        let good19 = create_synthetic_record(19, 5, "good19.txt", false, 200, 4096);
+        stream.extend_from_slice(&good19);
+
+        let mut parser = MftStreamParser::new(1024, 20 * 1024);
+        // Feed in 600-byte chunks to test split boundaries with malformed records
+        for chunk in stream.chunks_mut(600) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].record_no, 17);
+        assert_eq!(entries[1].record_no, 19);
+    }
+
+    #[test]
+    fn multiple_mft_extents() {
+        let cancel = AtomicBool::new(false);
+        // Extent 1 has records 0..20
+        let mut extent1 = vec![0u8; 20 * 1024];
+        extent1[5 * 1024..6 * 1024]
+            .copy_from_slice(&create_synthetic_record(5, 5, "root", true, 0, 0));
+        extent1[16 * 1024..17 * 1024]
+            .copy_from_slice(&create_synthetic_record(16, 5, "e1.txt", false, 100, 4096));
+
+        // Extent 2 has records 20..30
+        let mut extent2 = vec![0u8; 10 * 1024];
+        extent2[2 * 1024..3 * 1024]
+            .copy_from_slice(&create_synthetic_record(22, 5, "e2.txt", false, 200, 4096));
+
+        let mut parser = MftStreamParser::new(1024, 30 * 1024);
+        for chunk in extent1.chunks_mut(1500) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        for chunk in extent2.chunks_mut(1500) {
+            parser.process_chunk(chunk, &cancel).unwrap();
+        }
+        let entries = parser.into_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].record_no, 5);
+        assert_eq!(entries[1].record_no, 16);
+        assert_eq!(entries[2].record_no, 22);
+    }
 }
 
-/// Volume access and MFT streaming (Windows only).
-///
-/// Everything above this point is pure parsing; this shell is the only
-/// part that touches raw volume handles. It requires administrator
-/// rights; any failure returns `Err` and the caller falls back to normal
-/// directory traversal.
 /// Volume access and MFT streaming (Windows only).
 ///
 /// Everything above this point is pure parsing; this shell is the only
@@ -760,7 +1538,7 @@ mod tests {
 #[cfg(target_os = "windows")]
 pub mod reader {
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -770,8 +1548,8 @@ pub mod reader {
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use super::{
-        ATTR_TYPE_DATA, META_RECORDS, ROOT_RECORD, apply_fixups, attributes, build_model,
-        decode_runs, extract_entry, parse_data_attr,
+        ATTR_TYPE_DATA, MftStreamParser, apply_fixups, attributes, build_model, decode_runs,
+        parse_data_attr,
     };
     use crate::model::ScanModel;
 
@@ -950,9 +1728,8 @@ pub mod reader {
         let extents = mft_extents(handle, &vd)?;
         let rs = vd.bytes_per_record.max(128) as usize;
 
-        let mut entries: Vec<super::Entry> = Vec::with_capacity(64 * 1024);
-        let mut carry: Vec<u8> = Vec::new();
-        let mut next_record_no: u64 = 0;
+        let mut parser = MftStreamParser::new(rs, vd.mft_valid_length);
+        let mut chunk = vec![0u8; READ_CHUNK];
 
         for (lcn, clusters) in extents {
             let base = lcn
@@ -962,51 +1739,27 @@ pub mod reader {
                 .checked_mul(vd.bytes_per_cluster)
                 .ok_or("extent size overflows")?;
             seek_to(handle, base)?;
-            let mut chunk = vec![0u8; READ_CHUNK];
             let mut done: u64 = 0;
             while done < len {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
-                }
                 let take = (len - done).min(chunk.len() as u64) as usize;
                 read_exact(handle, &mut chunk[..take])?;
-                carry.extend_from_slice(&chunk[..take]);
                 done += take as u64;
 
-                // Consume whole records out of the carry buffer. Every MFT
-                // slot counts toward its record number even when skipped,
-                // because parent references are slot numbers.
-                while carry.len() >= rs {
-                    let mut record: Vec<u8> = carry.drain(..rs).collect();
-                    let record_no = next_record_no;
-                    next_record_no += 1;
-                    consume_record(record_no, &mut record, &mut entries);
-                }
-                if next_record_no * rs as u64 >= vd.mft_valid_length {
+                let keep_going = parser.process_chunk(&mut chunk[..take], cancel)?;
+                if !keep_going {
                     break;
                 }
             }
+            if parser.next_record_no() * (rs as u64) >= vd.mft_valid_length {
+                break;
+            }
         }
-        drop(carry);
 
+        let entries = parser.into_entries();
         let mut model =
             build_model(root, vd.serial, &entries).ok_or("MFT contains no root directory")?;
         model.free_space = Some(vd.free_clusters.saturating_mul(vd.bytes_per_cluster));
         Ok(model)
-    }
-
-    fn consume_record(record_no: u64, record: &mut [u8], entries: &mut Vec<super::Entry>) {
-        if record.len() < 4 || &record[0..4] != b"FILE" {
-            return;
-        }
-        if !super::record_in_use(record) {
-            return;
-        }
-        if (record_no >= META_RECORDS || record_no == ROOT_RECORD)
-            && let Ok(entry) = extract_entry(record_no, record)
-        {
-            entries.push(entry);
-        }
     }
 
     fn u32_at(buf: &[u8], off: usize) -> u32 {

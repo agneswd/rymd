@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 TOOLS = [
-    ("rymd", "rymd (full GUI model)"),
-    ("gdu-full", "gdu -n (full tree)"),
-    ("dua", "dua aggregate (full tree)"),
-    ("gdu-summarize", "gdu -s (totals only, lower bound)"),
+    (["rymd"], "Rymd (full in-memory GUI model)"),
+    (["gdu-tree"], "gdu --depth (full retained tree)"),
+    (["gdu-light", "gdu-full"], "gdu -n (lightweight aggregate)"),
+    (["dua-aggregate", "dua"], "dua aggregate (aggregate traversal)"),
+    (["gdu-summarize"], "gdu -s (totals only, lower bound)"),
 ]
 
 
@@ -59,8 +60,12 @@ def main() -> int:
         print(f"\n## {name}")
         print("| tool | mean ms | min | max | stddev |")
         print("| --- | --- | --- | --- | --- |")
-        for slug, label in TOOLS:
-            s = load(tree_dir / f"{slug}.json")
+        for slugs, label in TOOLS:
+            s = None
+            for slug in slugs:
+                s = load(tree_dir / f"{slug}.json")
+                if s:
+                    break
             if not s:
                 continue
             print(

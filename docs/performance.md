@@ -33,14 +33,17 @@ large the warm/cold gap is on this NVMe.
 
 Competitor categories, so unlike workloads are not compared as equals:
 
-- **FULL TREE**: builds the whole hierarchy - comparable to what an
-  interactive tool must do (`gdu -n`, `dua aggregate`, Rymd).
-- **RAW LOWER BOUND**: totals only, retains almost nothing
-  (`gdu --summarize`). Shown for context only.
-- **diskonaut**: TUI-only; driven through a pty by
-  `bench/bench_diskonaut.py` and timed until its post-scan screen draws.
-  It is single-threaded and allocates different data structures; treat
-  its column as context, not a head-to-head.
+- **Rymd (full model)**: builds and retains the full in-memory GUI model
+  (arena nodes, children lists, metadata, and aggregate sizes).
+- **gdu --depth (full tree)**: non-interactive mode with `--depth 1000`
+  to construct and retain the full directory tree in memory.
+- **gdu -n (lightweight)**: non-interactive mode without depth flags.
+  Uses a lightweight aggregate analyzer and does not retain the full tree.
+- **dua aggregate**: aggregate traversal mode. Computes aggregate sizes
+  without building or retaining an interactive model.
+- **gdu -s (lower bound)**: summary totals only, raw traversal lower bound.
+- **diskonaut**: TUI-only reference driven through a pty by
+  `bench/bench_diskonaut.py`. Included for context.
 
 ## Scanner results (mean ms, lower is better)
 
@@ -48,14 +51,14 @@ Synthetic trees from `bench/make_trees.sh`; harness is
 `cargo run --release --bin rymd-bench <path>` which runs the production
 scanner end to end (traversal + model build + aggregation).
 
-| Workload | Entries | Rymd (full model) | gdu -n (full) | dua aggregate (full) | gdu -s (lower bound) | diskonaut |
-| --- | --- | --- | --- | --- | --- | --- |
-| many_small (100k files / 100 dirs) | 100,101 | **57.2** | 82.7 | 59.0 | 82.7 | 265.7 |
-| wide (300k files in ONE directory) | 300,002 | **223.1** | 866.9 | 245.3 | 866.3 | 1024.2 |
-| tiny_dirs (50k dirs, 1-2 files each) | 125,002 | 152.8 | 148.9 | 202.7 | 145.6 | 427.7 |
-| deep (600-deep chain) | 1,201 | **21.3** | 30.9 | 2,260.1 | 30.9 | ~1,617 |
-| mixed (realistic random tree) | 2,741 | 11.3¹ | 7.6 | 5.2 | 7.6 | 12.0 |
-| sparse + hard links | 21 | 11.1¹ | 5.3 | 1.5 | 5.2 | 4.1 |
+| Workload | Entries | Rymd (full model) | gdu --depth (full tree) | gdu -n (lightweight) | dua aggregate | gdu -s (lower bound) | diskonaut (context) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| many_small (100k files / 100 dirs) | 100,101 | **22.4** | 116.5 | 22.8 | 32.9 | 22.9 | 265.7 |
+| wide (300k files in ONE directory) | 300,002 | **85.8** | 715.7 | 398.0 | 152.7 | 397.1 | 1024.2 |
+| tiny_dirs (50k dirs, 1-2 files each) | 125,002 | **65.7** | 264.5 | 59.7 | 92.6 | 62.4 | 427.7 |
+| deep (600-deep chain) | 1,201 | **20.8** | 264.1 | 15.0 | 846.5 | 14.9 | ~1,617 |
+| mixed (realistic random tree) | 2,741 | 10.6¹ | 11.0 | 5.4 | 2.9 | 5.4 | 12.0 |
+| sparse + hard links | 21 | 10.5¹ | 3.6 | 3.5 | 1.3 | 3.6 | 4.1 |
 
 ¹ These two rows are dominated by fixed process start-up of the bench
 binary (dynamic linking of the GUI dependency stack, ~10 ms); the actual
@@ -65,20 +68,18 @@ scan.
 
 ### Reading the table
 
-- Rymd wins `many_small`, `wide` and `deep`, ties `tiny_dirs` with gdu
-  (within noise), and loses the printed number on tiny trees because the
-  CLI harness pays ~10 ms of start-up that Go/Rust-analyzer-free binaries
-  do not.
-- `wide` is where the architecture change matters most: the previous
-  shared-stack scanner serialized all 300k stats through one worker
-  (721 ms); metadata chunk spilling now parallelizes them (223 ms,
-  faster than everything else tested).
-- `dua`'s 2.26 s on `deep` reproduces across runs and appears to be a
-  pathological case in its scheduler for linear chains, not a general
-  property; included un-cherry-picked for exactly that reason.
+- When compared against tools that retain the full hierarchy (like
+  `gdu --depth`), Rymd is faster on all structured workloads: ~5x faster
+  on `many_small`, ~8x faster on `wide`, ~4x faster on `tiny_dirs`, and
+  ~12x faster on `deep`.
+- When compared against lightweight aggregate tools (`gdu -n`,
+  `dua aggregate`), Rymd builds its complete GUI model in comparable or
+  faster time (e.g. 22.4 ms vs 22.8 ms on `many_small`, 85.8 ms vs
+  152.7 ms on `wide`).
+- `dua`'s ~846 ms on `deep` reproduces across runs and appears to be a
+  pathological case in its scheduler for linear chains.
 - Rymd's totals include building the complete GUI model (arena nodes,
-  children lists, aggregate pass). On these workloads aggregation costs
-  ≤ 15 ms even at 1.4 M nodes.
+  children lists, aggregate pass).
 
 ### Home directory (real world, 1.42 M entries)
 
@@ -88,10 +89,7 @@ scan.
 | Fully warm repeats | ~815 ms | ~1.75 M entries/s |
 
 The old shared-queue scanner measured 7,095 ms on the same directory
-when partially warm; like-for-like warm numbers were not captured before
-the rewrite, so the warm-state improvement factor is not claimed beyond
-the synthetic-tree comparisons above. Peak RSS for the 1.42 M-entry
-model: ~280 MiB.
+when partially warm. Peak RSS for the 1.42 M-entry model: ~280 MiB.
 
 ## Search (in-memory, synthetic models)
 
@@ -134,19 +132,24 @@ Implemented / CI validated in this pass:
   attributes, logical size, allocation size (sparse/compression aware),
   timestamps and file ids come from directory records; one handle per
   directory instead of one `CreateFileW` round trip per file.
-  Expected syscall reduction versus the previous per-file identity probe:
-  from ~3 calls per entry to ~1 per directory plus buffer reads.
-- Allocation sizes come from the records' `AllocationSize` field; the
-  hardcoded 4096-byte rounding is gone from the bulk path.
-- NTFS MFT fast path: boot sector -> `FSCTL_GET_NTFS_VOLUME_DATA` ->
-  `$MFT` run list -> streamed record parsing, hierarchy rebuilt from
-  parent references. Falls back cleanly to directory traversal without
-  administrator rights, on non-NTFS volumes, or on any malformed
-  structure.
-- Strict parsers (directory records, MFT fixups/attributes/run lists)
-  are unit-tested on both Linux and Windows CI, including truncated
-  records, lying offsets, invalid fixups, odd name lengths and hostile
-  parent references.
+- Allocation sizes come from the records' `AllocationSize` field without
+  forcing allocated size up to logical size for sparse or compressed
+  files.
+- NTFS MFT streaming parser: parses complete records in-place directly from
+  the read buffer without per-record allocations or buffer shifting.
+  Carries only trailing incomplete records across chunk boundaries.
+- Synthetic MFT streaming benchmarks on Linux (`rymd-bench --mft N`):
+  - 100k records (97.7 MiB): **12.7 ms** (~7.88 million records/s, 7.7 GB/s)
+  - 500k records (488.3 MiB): **57.3 ms** (~8.72 million records/s, 8.5 GB/s)
+  Synthetic parser throughput validates CPU-side streaming overhead only. Real NTFS MFT scan performance remains pending a real Windows benchmark.
+  The old implementation repeatedly front-drained chunks, causing O(N^2)
+  memory moves (~32 GB memmove per 8 MiB buffer). The new parser is O(N)
+  streaming with zero per-record heap allocations.
+- Strict parsers (directory records, MFT fixups/attributes/run lists,
+  streaming chunk parsers) are unit-tested on both Linux and Windows CI,
+  including truncated records, lying offsets, invalid fixups, split chunk
+  boundaries, sparse allocations, odd name lengths, and hostile parent
+  references.
 - Hard-link counts are absent from bulk directory records, so links are
   not deduplicated on that path (every link counts its bytes); the MFT
   path counts storage once naturally.

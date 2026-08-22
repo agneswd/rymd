@@ -35,8 +35,23 @@ fn main() {
         return;
     }
 
+    // Synthetic MFT streaming parser benchmark: rymd-bench --mft N
+    if first.as_deref() == Some("--mft") {
+        let n = args
+            .next()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                eprintln!("--mft requires a record count");
+                std::process::exit(2);
+            });
+        run_mft_bench(n);
+        return;
+    }
+
     let Some(root) = first.map(PathBuf::from) else {
-        eprintln!("usage: rymd-bench <path> [--runs N] [--json] | rymd-bench --search N");
+        eprintln!(
+            "usage: rymd-bench <path> [--runs N] [--json] | rymd-bench --search N | rymd-bench --mft N"
+        );
         std::process::exit(2);
     };
     let mut runs = 1usize;
@@ -327,4 +342,76 @@ fn run_search_bench(nodes: usize) {
 
 fn elapsed_ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
+}
+
+// ---- synthetic MFT streaming benchmark ---------------------------------
+
+fn run_mft_bench(records: usize) {
+    use rymd::scan::platform::mft::{
+        META_RECORDS, MftStreamParser, ROOT_RECORD, create_synthetic_record,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    println!("generating {records} synthetic MFT records...");
+    let t0 = Instant::now();
+    let total_slots = records + META_RECORDS as usize;
+    let mut stream = vec![0u8; total_slots * 1024];
+
+    // Root record at slot 5
+    let root_rec = create_synthetic_record(ROOT_RECORD, ROOT_RECORD, "C:", true, 0, 0);
+    stream[ROOT_RECORD as usize * 1024..(ROOT_RECORD as usize + 1) * 1024]
+        .copy_from_slice(&root_rec);
+
+    // User records starting at slot 16
+    for i in 0..records {
+        let rec_no = META_RECORDS + i as u64;
+        let is_dir = i % 10 == 0;
+        let name = if is_dir {
+            format!("dir_{i:06}")
+        } else {
+            format!("file_{i:06}.dat")
+        };
+        let (logical, allocated) = if is_dir {
+            (0, 0)
+        } else if i % 5 == 0 {
+            // Sparse file
+            (100 * 1024 * 1024, 4 * 1024)
+        } else if i % 3 == 0 {
+            // Resident
+            (32, 0)
+        } else {
+            // Ordinary non-resident
+            ((i as u64 + 1) * 512, (i as u64 + 1) * 4096)
+        };
+        let rec = create_synthetic_record(rec_no, ROOT_RECORD, &name, is_dir, logical, allocated);
+        let off = rec_no as usize * 1024;
+        stream[off..off + 1024].copy_from_slice(&rec);
+    }
+    println!(
+        "generated {:.2} MiB in {:.1} ms",
+        stream.len() as f64 / (1024.0 * 1024.0),
+        elapsed_ms(t0)
+    );
+
+    let cancel = AtomicBool::new(false);
+    let chunk_size = 8 * 1024 * 1024; // 8 MiB chunk reads
+    let total_bytes = stream.len() as u64;
+
+    // Benchmark new streaming parser
+    let mut stream_copy = stream.clone();
+    let t1 = Instant::now();
+    let mut parser = MftStreamParser::new(1024, total_bytes);
+    for chunk in stream_copy.chunks_mut(chunk_size) {
+        parser.process_chunk(chunk, &cancel).unwrap();
+    }
+    let parse_ms = elapsed_ms(t1);
+    let entries = parser.into_entries();
+    let mib_per_sec = (total_bytes as f64 / (1024.0 * 1024.0)) / (parse_ms / 1000.0);
+    let recs_per_sec = (records as f64) / (parse_ms / 1000.0);
+    println!(
+        "MFT streaming parser: {parse_ms:.2} ms | parsed {} entries | throughput: {:.0} records/s ({:.1} MiB/s)",
+        entries.len(),
+        recs_per_sec,
+        mib_per_sec
+    );
 }
