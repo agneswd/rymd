@@ -448,7 +448,14 @@ impl Element for TreemapElement {
                                         )
                                     });
                                     let origin = tile_origin + point(px(4.0), px(4.0));
-                                    let _ = line.paint(origin, px(14.5), gpui::TextAlign::Left, None, window, cx);
+                                    let _ = line.paint(
+                                        origin,
+                                        px(14.5),
+                                        gpui::TextAlign::Left,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
                                     if let Some(sub) = &visual.sublabel {
                                         let run = gpui::TextRun {
                                             len: sub.len(),
@@ -659,7 +666,14 @@ fn paint_tooltip(
     ));
     let mut y = origin_y + pad;
     for shaped in shaped_lines {
-        let _ = shaped.paint(point(origin_x + pad, y), line_h, gpui::TextAlign::Left, None, window, cx);
+        let _ = shaped.paint(
+            point(origin_x + pad, y),
+            line_h,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
         y += line_h;
     }
 }

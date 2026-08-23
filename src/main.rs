@@ -59,7 +59,6 @@ fn main() {
                 is_movable: true,
                 is_resizable: true,
                 is_minimizable: true,
-                app_owns_titlebar_drag: true,
                 ..Default::default()
             },
             |window, cx| {
