@@ -410,7 +410,7 @@ impl AppShell {
                     .on_click(cx.listener(|shell, _, _, cx| shell.cancel_update_download(cx))),
                 v_flex()
                     .gap_2()
-                    .child(Progress::new().value(progress.unwrap_or(0.)))
+                    .child(Progress::new("download-progress").value(progress.unwrap_or(0.)))
                     .child(
                         h_flex()
                             .justify_between()

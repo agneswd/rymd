@@ -136,7 +136,7 @@ impl AppShell {
 
         let focus_handle = cx.focus_handle();
         // Receive global shortcuts without clicking first.
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
 
         let mut state = AppState::default();
         if std::env::var("RYMD_TAB").as_deref() == Ok("duplicates") {
@@ -1107,7 +1107,7 @@ impl AppShell {
             self.navigate_to(parent, cx);
         }
         self.select_node(node, cx);
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
     }
 
     /// The path of a search result, resolved only when a row is shown.
