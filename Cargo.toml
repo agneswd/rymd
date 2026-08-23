@@ -27,11 +27,6 @@ thiserror = "2"
 trash = "5"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
-[patch."https://github.com/zed-industries/zed"]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "0.2.2" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5" }
-gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5" }
-
 [patch.crates-io]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "0.2.2" }
 
