@@ -2194,8 +2194,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "979b45cfa6ec723b6f42330915a1b3769b930d02b2d505f9697f8ca602bee707"
+source = "git+https://github.com/zed-industries/zed?rev=2993d25554531063184e5dd94a2289708cde09db#2993d25554531063184e5dd94a2289708cde09db"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",

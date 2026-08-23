@@ -42,7 +42,11 @@ jobs:
           sudo apt-get install -y \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-cursor-dev libvulkan-dev libudev-dev \
+            libfontconfig1-dev \
             cmake clang build-essential gcc-mingw-w64-x86-64
+
+      - name: Dependency tree verification
+        run: cargo tree -i gpui
 
       - name: Format
         if: runner.os == 'Linux'
