@@ -5887,4 +5887,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-test (ubuntu-24.04)	Format	∩╗┐2026-08-23T18:02:42.1780684Z ##[group]Run cargo fmt --all --check

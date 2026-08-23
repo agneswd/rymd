@@ -48,10 +48,6 @@ jobs:
       - name: Dependency tree verification
         run: cargo tree -i gpui
 
-      - name: Print Cargo.lock
-        if: runner.os == 'Linux'
-        run: cat Cargo.lock
-
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
