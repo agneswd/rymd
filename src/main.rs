@@ -56,6 +56,9 @@ fn main() {
                 titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(900.), px(600.))),
                 app_id: Some("rymd".into()),
+                is_movable: true,
+                is_resizable: true,
+                is_minimizable: true,
                 ..Default::default()
             },
             |window, cx| {

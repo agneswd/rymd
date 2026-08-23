@@ -5,9 +5,9 @@ edition = "2024"
 description = "A calm disk usage visualizer for Windows and Linux"
 
 [dependencies]
-gpui = "0.2.2"
-gpui-component = "0.5.1"
-gpui-component-assets = "0.5.1"
+gpui = { git = "https://github.com/zed-industries/zed", version = "0.2.2" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "11b02b0e7a9fb51639dd9a28f3ad5aa4f99fdd81" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "11b02b0e7a9fb51639dd9a28f3ad5aa4f99fdd81" }
 
 anyhow = "1"
 blake3 = "1"
@@ -26,6 +26,9 @@ tempfile = "3"
 thiserror = "2"
 trash = "5"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[patch.crates-io]
+gpui = { git = "https://github.com/zed-industries/zed", version = "0.2.2" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

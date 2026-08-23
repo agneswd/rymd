@@ -117,8 +117,8 @@ impl TableDelegate for DuplicatesDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
     }
 
     fn render_td(
