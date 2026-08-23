@@ -53,10 +53,12 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(900.), px(600.))),
                 app_id: Some("rymd".into()),
-                ..Default::default()
+                is_movable: true,
+                is_resizable: true,
+                is_minimizable: true,
+                ..gpui_component::TitleBar::window_options()
             },
             |window, cx| {
                 let shell = cx.new(|cx| AppShell::new(window, cx));
